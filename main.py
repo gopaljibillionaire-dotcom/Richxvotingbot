@@ -687,6 +687,44 @@ def get_leave_channel_options_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🔙 Return Back", callback_data="task_hub_start")]
     ])
 
+# --- HELPER WORKFLOW PROCEDURES ---
+async def prompt_for_account_scale(target_message: Any):
+    user_id = target_message.from_user.id if hasattr(target_message, "from_user") else target_message.chat.id
+    set_user_state(user_id, "waiting_for_account_scale")
+    prompt_text = "<b>Step Last: Specify total account capacity allocation quantity to deploy for this campaign (e.g. 5, 10, 50):</b>"
+    if isinstance(target_message, CallbackQuery):
+        await target_message.message.edit_text(prompt_text, parse_mode=enums.ParseMode.HTML)
+    else:
+        await target_message.reply_text(prompt_text, parse_mode=enums.ParseMode.HTML)
+
+async def finalize_task_creation(message: Message, bot_client: Client):
+    user_id = message.from_user.id
+    _, task_payload = get_user_state(user_id)
+    clear_user_state(user_id)
+
+    task_type = task_payload.get("task_type", "unknown")
+    task_id = str(int(time.time() * 1000))
+
+    await db_mgr.tasks.insert_one({
+        "_id": task_id,
+        "creator_id": user_id,
+        "task_type": task_type,
+        "payload": task_payload,
+        "status": "pending",
+        "progress": "0%",
+        "created_at": time.time()
+    })
+
+    status_msg = await message.reply_text(
+        f"🚀 <b>Campaign Deployment Queued!</b>\n"
+        f"Campaign Task ID: <code>#{task_id}</code>\n"
+        f"Type: <code>{task_type.upper()}</code>\n"
+        f"Initializing background thread execution loop...",
+        parse_mode=enums.ParseMode.HTML
+    )
+
+    await task_queue.add_task(task_id, user_id, task_type, task_payload, bot_client, status_msg.id)
+
 # --- PYROGRAM BOT INSTANCE ---
 app = Client("MultiAccountSystemBot", api_id=config.API_ID, api_hash=config.API_HASH, bot_token=config.BOT_TOKEN)
 
@@ -1715,247 +1753,185 @@ async def task_hub_process_leave_choice(client: Client, callback: CallbackQuery)
 async def handle_vote_mode_choice(client: Client, callback: CallbackQuery):
     await callback.answer()
     user_id = callback.from_user.id
-    vmode = callback.data.split(":")[1]
-    set_user_state(user_id, "waiting_for_vote_mode_choice", {"vote_mode": vmode})
-    
-    if vmode == "inline":
-        await callback.message.edit_text("<b>Step 4b: Enter identical text string label shown on target inline button:</b>", parse_mode=enums.ParseMode.HTML)
-        set_user_state(user_id, "waiting_for_button_text")
-    else:
-        await callback.message.edit_text("<b>Step 4b: Enter native question option choice index number to register (First option starts at 0, Second is 1, etc):</b>", parse_mode=enums.ParseMode.HTML)
+    mode = callback.data.split(":")[1]
+    set_user_state(user_id, "waiting_for_vote_mode_choice", {"vote_mode": mode})
+
+    if mode == "poll":
+        await callback.message.edit_text("<b>Step 4a: Enter 0-based Poll Option Index to click (e.g. 0 for first option, 1 for second option):</b>", parse_mode=enums.ParseMode.HTML)
         set_user_state(user_id, "waiting_for_poll_option_index")
+    else:
+        await callback.message.edit_text("<b>Step 4a: Enter exact target button text string to match inline callback button:</b>", parse_mode=enums.ParseMode.HTML)
+        set_user_state(user_id, "waiting_for_button_text")
 
 @app.on_callback_query(filters.regex("^toggle_emoji:"))
 async def handle_toggle_emoji(client: Client, callback: CallbackQuery):
     await callback.answer()
-    user_id = callback.from_user.id
     emoji = callback.data.split(":")[1]
-    _, data = get_user_state(user_id)
-    selected = data.get("selected_emojis", [])
+    user_id = callback.from_user.id
+
+    _, fsm_data = get_user_state(user_id)
+    selected = fsm_data.get("selected_emojis", [])
+
     if emoji in selected:
         selected.remove(emoji)
     else:
         selected.append(emoji)
+
     set_user_state(user_id, "waiting_for_emojis", {"selected_emojis": selected})
     await callback.message.edit_reply_markup(reply_markup=get_emoji_selection_keyboard(selected))
 
 @app.on_callback_query(filters.regex("^finish_emoji_selection$"))
-async def finish_emoji_selection(client: Client, callback: CallbackQuery):
-    user_id = callback.from_user.id
-    _, data = get_user_state(user_id)
-    selected = data.get("selected_emojis", [])
-    if not selected:
-        await callback.answer("⚠️ You must pick at least 1 active target reaction element.", show_alert=True)
-        return
+async def handle_finish_emoji_selection(client: Client, callback: CallbackQuery):
     await callback.answer()
-    set_user_state(user_id, "waiting_for_emojis", {"reactions": selected})
+    user_id = callback.from_user.id
+    _, fsm_data = get_user_state(user_id)
+    selected = fsm_data.get("selected_emojis", [])
+
+    if not selected:
+        set_user_state(user_id, "waiting_for_emojis", {"reactions": ["👍"]})
+    else:
+        set_user_state(user_id, "waiting_for_emojis", {"reactions": selected})
+
     await prompt_for_account_scale(callback.message)
 
-async def prompt_for_account_scale(message: Message):
-    user_id = message.chat.id if isinstance(message, Message) else message.from_user.id
-    role = await db_mgr.get_user_role(user_id)
-    _, data = get_user_state(user_id)
-    account_routing = data.get("account_routing", "own")
-    
-    if role == "super_owner" and account_routing == "all":
-        max_available = await db_mgr.accounts.count_documents({"status": "active"})
-    elif role == "owner":
-        max_available = await db_mgr.accounts.count_documents({"status": "active"})
-    else:
-        assigned_phones = [doc["phone"] async for doc in db_mgr.assignments.find({"user_id": user_id})]
-        max_available = await db_mgr.accounts.count_documents({
-            "status": "active",
-            "$or": [{"user_id": user_id}, {"phone": {"$in": assigned_phones}}]
-        })
-        
-    prompt_msg = (
-        f"🔢 <b>Account Deployment Volume Capacity Selection</b>\n\n"
-        f"Total available online session keys within selected boundary: <code>{max_available}</code>\n"
-        f"Input capacity allocation limits variable to run:\n"
-        f"<i>(Type <code>0</code> to mobilize ALL available online sessions matching boundary parameters)</i>"
-    )
-    
-    if isinstance(message, Message):
-        await message.reply_text(prompt_msg, parse_mode=enums.ParseMode.HTML)
-    else:
-        await message.reply_text(prompt_msg, parse_mode=enums.ParseMode.HTML)
-        
-    set_user_state(user_id, "waiting_for_account_scale")
-
-async def finalize_task_creation(message: Message, bot_client: Client):
-    user_id = message.chat.id if isinstance(message, Message) else message.from_user.id
-    _, data = get_user_state(user_id)
-    task_type = data.pop("task_type")
-    target = data.get("target", "")
-    
-    if data.get("leave_mode") != "all":
-        _, link_msg_id, _ = parse_telegram_link(target)
-        if link_msg_id:
-            data["msg_id"] = link_msg_id
-
-    init_msg = await bot_client.send_message(
-        chat_id=user_id, 
-        text="⏳ <b>Bootstrapping cluster deployment threads...</b>\n<i>Connecting active endpoints pool, please maintain connection standby...</i>",
-        parse_mode=enums.ParseMode.HTML
-    )
-
-    task_doc = {
-        "creator_id": user_id,
-        "type": task_type,
-        "payload": data,
-        "status": "pending",
-        "progress": "0%",
-        "created_at": time.time()
-    }
-    result = await db_mgr.tasks.insert_one(task_doc)
-    task_id = str(result.inserted_id)
-
-    await task_queue.add_task(task_id, user_id, task_type, data, bot_client, init_msg.id)
-    clear_user_state(user_id)
-
-# --- REPORTS & STATS INTERFACES ---
 @app.on_callback_query(filters.regex("^view_tasks$"))
-async def view_tasks(client: Client, callback: CallbackQuery):
-    user_id = callback.from_user.id
+async def handle_view_tasks(client: Client, callback: CallbackQuery):
     await callback.answer()
+    user_id = callback.from_user.id
     role = await db_mgr.get_user_role(user_id)
-    
+
     if role in ["owner", "super_owner"]:
-        cursor = db_mgr.tasks.find({}).sort("_id", -1).limit(10)
+        cursor = db_mgr.tasks.find({}).sort("created_at", -1).limit(10)
     else:
-        cursor = db_mgr.tasks.find({"creator_id": user_id}).sort("_id", -1).limit(10)
+        cursor = db_mgr.tasks.find({"creator_id": user_id}).sort("created_at", -1).limit(10)
 
     rows = [doc async for doc in cursor]
 
-    text = "📊 <b>Historical Campaign Event Feed Records Index Matrix</b>\n\n"
-    for r in rows:
-        t_id = str(r["_id"])
-        text += f"🔹 <b>Task Sheet:</b> <code>#{t_id}</code> (Type: <code>{r['type'].upper()}</code>)\nState tracking: <b>{r['status']}</b> | Metrics: <code>{r['progress']}</code>\nTo call full details map command layout: <code>/taskreport_{t_id}</code>\n\n"
-    await callback.message.edit_text(text if rows else "No active campaign tracking logs catalogued inside runtime registers.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(text="🔙 Return Back", callback_data="main_menu")]]), parse_mode=enums.ParseMode.HTML)
+    text = "📊 <b>Recent Campaign Logs Matrix</b>\n\n"
+    if not rows:
+        text += "<i>No recent campaign tasks registered.</i>"
+    else:
+        for r in rows:
+            st = r.get("status", "pending")
+            badge = "🟢" if st == "completed" else ("🟡" if st == "running" else "🔴")
+            text += f"{badge} Task ID: <code>#{r['_id']}</code> | Type: <b>{r.get('task_type', 'N/A').upper()}</b>\nStatus: <code>{st.upper()}</code> ({r.get('progress', '0%')})\n\n"
 
-@app.on_message(filters.regex("^/taskreport_") & filters.private)
-async def cmd_task_report(client: Client, message: Message):
-    user_id = message.from_user.id
-    role = await db_mgr.get_user_role(user_id)
-    try:
-        task_id = message.text.split("_")[1].strip()
-    except:
-        return
-        
-    from bson.objectid import ObjectId
-    try:
-        row = await db_mgr.tasks.find_one({"_id": ObjectId(task_id)})
-    except Exception:
-        row = await db_mgr.tasks.find_one({"_id": task_id})
-
-    if not row or (role not in ["owner", "super_owner"] and row["creator_id"] != user_id):
-        await message.reply_text("🚫 <b>Data Visibility Restriction Mismatch:</b> Permissions key clearance verification rejected.")
-        return
-
-    report_text = f"📊 <b>Detailed Campaign Metrics Tracking Log</b>\n\n🗂️ Task Sheet reference ID: <code>#{task_id}</code>\n⚡ Code Action signature: <code>{row['type'].upper()}</code>\n🪐 State string indicator: <b>{row['status']}</b>\n📈 Progress indicators graph matrix: <code>{row['progress']}</code>"
-    await message.reply_text(report_text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(text="💎 Home Menu", callback_data="main_menu")]]), parse_mode=enums.ParseMode.HTML)
+    buttons = [[InlineKeyboardButton(text="💎 Home Menu", callback_data="main_menu")]]
+    await callback.message.edit_text(text=text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode=enums.ParseMode.HTML)
 
 @app.on_callback_query(filters.regex("^view_referrals$"))
-async def view_referrals(client: Client, callback: CallbackQuery):
-    user_id = callback.from_user.id
+async def handle_view_referrals(client: Client, callback: CallbackQuery):
     await callback.answer()
-    count = await db_mgr.users.count_documents({"referred_by": user_id})
-    await callback.message.edit_text(f"👥 <b>Invitation Line Tracking Matrix Analytics</b>\n\nShare your connection link string layout below to register downline user clusters:\n<code>https://t.me/{bot_username}?start=ref_{user_id}</code>\n\nTotal validated downline invitations mapped to your account line reference: <code>{count}</code> accounts.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(text="🔙 Return Back", callback_data="main_menu")]]), parse_mode=enums.ParseMode.HTML)
+    user_id = callback.from_user.id
+    ref_link = f"https://t.me/{bot_username}?start=ref_{user_id}"
+    ref_count = await db_mgr.users.count_documents({"referred_by": user_id})
+
+    text = (
+        f"⚜️ <b>Referral System Module</b>\n\n"
+        f"Share your link to invite new system operators:\n"
+        f"<code>{ref_link}</code>\n\n"
+        f"👥 Total Referred Users: <code>{ref_count}</code>"
+    )
+    buttons = [[InlineKeyboardButton(text="💎 Home Menu", callback_data="main_menu")]]
+    await callback.message.edit_text(text=text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode=enums.ParseMode.HTML)
 
 @app.on_callback_query(filters.regex("^admin_panel$"))
 async def handle_admin_panel(client: Client, callback: CallbackQuery):
+    user_id = callback.from_user.id
+    role = await db_mgr.get_user_role(user_id)
+
+    if role not in ["admin", "owner", "super_owner"]:
+        await callback.answer("🚫 Unauthorized action.", show_alert=True)
+        return
+
     await callback.answer()
-    await callback.message.edit_text(
-        "🛡️ <b>Administrative Operational Console Index Terminal</b>\n\n"
-        "Available terminal shell command scripts layout frameworks:\n\n"
-        "🔹 <code>/grantaccess &lt;user_id&gt; [count]</code> - Grant task access for account IDs to user\n"
-        "🔹 <code>/revokeaccess &lt;user_id&gt;</code> - Revoke granted account access\n"
-        "🔹 <code>/addadmin &lt;id&gt;</code> - Promote user node into admin status ranks\n"
-        "🔹 <code>/removeadmin &lt;id&gt;</code> - Deprecate admin structural token access rules\n"
-        "🔹 <code>/purgedatabase</code> - Delete/Purge full database collections\n"
-        "🔹 <code>/dbstorage</code> - Check MongoDB memory size & total database storage\n"
-        "🔹 <code>/broadcast</code> - Force dynamic notification content across global users pools\n"
-        "🔹 <code>/canceltasks</code> - Instantly kill all running thread operations loops safely",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(text="💎 Return Home Menu", callback_data="main_menu")]]),
-        parse_mode=enums.ParseMode.HTML
+    text = (
+        f"🛡️ <b>Administrator Management Core Panel</b>\n\n"
+        f"Your system role: <b>{role.upper()}</b>\n"
+        f"Select system administrative action below:"
     )
+    buttons = [
+        [InlineKeyboardButton(text="💾 Database Storage Telemetry", callback_data="btn_db_storage")],
+        [InlineKeyboardButton(text="📢 Global User Broadcast", callback_data="btn_start_broadcast")],
+        [InlineKeyboardButton(text="🛑 Abort All Tasks", callback_data="btn_abort_all_tasks")],
+        [InlineKeyboardButton(text="💥 Complete Database Purge", callback_data="confirm_purge_database")],
+        [InlineKeyboardButton(text="💎 Home Menu", callback_data="main_menu")]
+    ]
+    await callback.message.edit_text(text=text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode=enums.ParseMode.HTML)
+
+@app.on_callback_query(filters.regex("^btn_db_storage$"))
+async def handle_btn_db_storage(client: Client, callback: CallbackQuery):
+    await callback.answer()
+    stats = await db_mgr.get_storage_stats()
+    total_mb = stats["total_size"] / (1024 * 1024)
+    data_mb = stats["data_size"] / (1024 * 1024)
+    
+    text = (
+        f"💾 <b>MongoDB Real-Time Storage Telemetry Matrix</b>\n\n"
+        f"📊 <b>Total Database Size:</b> <code>{total_mb:.2f} MB</code>\n"
+        f"📁 <b>Uncompressed Payload:</b> <code>{data_mb:.2f} MB</code>\n"
+        f"📦 <b>Total Document Objects:</b> <code>{stats['objects']}</code>"
+    )
+    await callback.message.edit_text(text=text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(text="🔙 Admin Panel", callback_data="admin_panel")]]), parse_mode=enums.ParseMode.HTML)
+
+@app.on_callback_query(filters.regex("^btn_start_broadcast$"))
+async def handle_btn_start_broadcast(client: Client, callback: CallbackQuery):
+    await callback.answer()
+    user_id = callback.from_user.id
+    await callback.message.edit_text("📢 <b>Input text or multimedia payload content to broadcast:</b>", parse_mode=enums.ParseMode.HTML)
+    set_user_state(user_id, "waiting_for_broadcast_msg")
+
+@app.on_callback_query(filters.regex("^btn_abort_all_tasks$"))
+async def handle_btn_abort_all_tasks(client: Client, callback: CallbackQuery):
+    await callback.answer()
+    killed_count = await task_queue.cancel_all_active_tasks()
+    await db_mgr.tasks.update_many(
+        {"$or": [{"status": "pending"}, {"status": "running"}]},
+        {"$set": {"status": "cancelled"}}
+    )
+    await callback.message.edit_text(f"🛑 <b>Tasks Terminated!</b> Aborted <code>{killed_count}</code> task processes.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(text="🔙 Admin Panel", callback_data="admin_panel")]]), parse_mode=enums.ParseMode.HTML)
 
 @app.on_callback_query(filters.regex("^system_stats$"))
-async def system_stats(client: Client, callback: CallbackQuery):
+async def handle_system_stats(client: Client, callback: CallbackQuery):
     await callback.answer()
     user_id = callback.from_user.id
     role = await db_mgr.get_user_role(user_id)
-    
-    if role != "super_owner":
-        await callback.message.edit_text("🚫 System metrics dashboard view access restricted to core developers.")
+
+    if role not in ["owner", "super_owner"]:
+        await callback.message.reply_text("🚫 Privilege violation.")
         return
-        
+
     total_users = await db_mgr.users.count_documents({})
     total_accounts = await db_mgr.accounts.count_documents({})
     active_accounts = await db_mgr.accounts.count_documents({"status": "active"})
-    
-    distinct_user_ids = await db_mgr.accounts.distinct("user_id")
-    cursor = db_mgr.users.find({
-        "$or": [{"role": "admin"}, {"user_id": {"$in": distinct_user_ids}}]
-    })
-    
-    admin_metrics_text = "\n👥 <b>Structural Account Space Partition Allocation Map Logs:</b>\n"
-    async for u in cursor:
-        u_id = u["user_id"]
-        acc_count = await db_mgr.accounts.count_documents({"user_id": u_id})
-        admin_metrics_text += f"• Node profile target: <code>{u_id}</code> (<b>@{u.get('username', 'None')}</b>) [<b>{u['role'].upper()}</b>] ➜ Linked slots count: <code>{acc_count}</code> items\n"
-            
-    stats_text = (
-        f"📈 <b>Live System Production Core Performance Summary Metrics</b>\n\n"
-        f"👥 Global active profiles space size: <code>{total_users}</code> users\n"
-        f"📱 Total linked terminal telephony sessions: <code>{total_accounts}</code> instances\n"
-        f"🟢 Active operational connection streams online: <code>{active_accounts}</code> nodes\n"
-        f"----------------------------------------------------"
-        f"{admin_metrics_text}"
+    dead_accounts = await db_mgr.accounts.count_documents({"status": "dead"})
+
+    text = (
+        f"📈 <b>System Statistics & Metrics</b>\n\n"
+        f"👤 Total Registered System Users: <code>{total_users}</code>\n"
+        f"📱 Total Linked Accounts Pool: <code>{total_accounts}</code>\n"
+        f"🟢 Active Operational Accounts: <code>{active_accounts}</code>\n"
+        f"🔴 Dead / Expired Session Keys: <code>{dead_accounts}</code>"
     )
-    
-    await callback.message.edit_text(text=stats_text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(text="💎 Return Home Menu", callback_data="main_menu")]]), parse_mode=enums.ParseMode.HTML)
+    buttons = [[InlineKeyboardButton(text="💎 Home Menu", callback_data="main_menu")]]
+    await callback.message.edit_text(text=text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode=enums.ParseMode.HTML)
 
-# --- BOOTSTRAPPING RUNTIME ---
-async def verify_saved_sessions():
-    logger.info("Verifying all active account database sessions...")
-    cursor = db_mgr.accounts.find({"status": "active"})
-    accounts = [doc async for doc in cursor]
-    
-    semaphore = asyncio.Semaphore(10)
-    async def check_account(phone, enc_session):
-        async with semaphore:
-            try:
-                client = TelegramClient(StringSession(decrypt_data(enc_session)), config.API_ID, config.API_HASH)
-                await client.connect()
-                if not await client.is_user_authorized():
-                    await db_mgr.accounts.update_one({"phone": phone}, {"$set": {"status": "dead"}})
-                await client.disconnect()
-            except:
-                pass
-                
-    await asyncio.gather(*(check_account(acc["phone"], acc["session_string"]) for acc in accounts))
-
+# --- APPLICATION ENTRY POINT ---
 async def main():
     global bot_username
     await db_mgr.init()
-    await verify_saved_sessions()
-    
-    worker_task = asyncio.create_task(task_queue.start_worker())
+    asyncio.create_task(task_queue.start_worker())
     
     await app.start()
-    bot_info = await app.get_me()
-    bot_username = bot_info.username
-    logger.info(f"Bot started as @{bot_username}")
+    me = await app.get_me()
+    bot_username = me.username or "bot"
+    logger.info(f"Bot started successfully as @{bot_username}")
     
-    try:
-        await asyncio.Event().wait()
-    finally:
-        worker_task.cancel()
-        await app.stop()
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
+    loop = asyncio.get_event_loop()
     try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Bot execution successfully stopped.")
+        loop.run_until_complete(main())
+    except KeyboardInterrupt:
+        logger.info("Bot execution loop stopped.")
