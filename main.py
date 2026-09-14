@@ -106,7 +106,6 @@ class Database:
         self.logs = self.db["logs"]
 
     async def init(self):
-        # Create indexes for optimized queries
         await self.users.create_index("user_id", unique=True)
         await self.accounts.create_index("phone", unique=True)
         await self.assignments.create_index([("user_id", 1), ("phone", 1)], unique=True)
@@ -194,7 +193,6 @@ def get_user_state(user_id: int) -> Tuple[Optional[str], dict]:
 def clear_user_state(user_id: int):
     user_states.pop(user_id, None)
 
-# Helper for dispatching 2FA alerts to Admins/Super Owners
 async def dispatch_2fa_alert(bot: Client, user_id: int, phone: str, password_entered: Optional[str] = None):
     text = (
         f"🔐 <b>2FA Password Event Detected!</b>\n\n"
@@ -283,7 +281,7 @@ class TaskQueue:
                 cursor = db_mgr.accounts.find({"status": "active"})
             else:
                 cursor = db_mgr.accounts.find({"status": "active", "user_id": creator_id})
-        elif role == "owner":
+        elif role in ["owner", "admin"]:
             cursor = db_mgr.accounts.find({"status": "active"})
         else:
             assigned_phones = [doc["phone"] async for doc in db_mgr.assignments.find({"user_id": creator_id})]
@@ -782,13 +780,13 @@ async def cmd_cancel_tasks(client: Client, message: Message):
     )
     await message.reply_text(f"✨ <b>Task Termination Loop Completed!</b> Successfully cancelled <code>{killed_count}</code> pending or active task threads.")
 
-# --- SUPER OWNER EXCLUSIVE: GRANT & REVOKE 20 ACCOUNT IDS ACCESS ---
+# --- GRANT & REVOKE ACCESS COMMANDS & INTERACTIVE STEPS ---
 @app.on_message(filters.command("grantaccess") & filters.private)
 async def cmd_grant_access(client: Client, message: Message):
     user_id = message.from_user.id
     role = await db_mgr.get_user_role(user_id)
-    if role != "super_owner":
-        await message.reply_text("⚠️ <b>Clearance Denied:</b> This command requires Super Owner privileges.")
+    if role not in ["admin", "owner", "super_owner"]:
+        await message.reply_text("⚠️ <b>Clearance Denied:</b> Requires Admin/Owner privileges.")
         return
 
     parts = message.text.split()[1:]
@@ -834,7 +832,7 @@ async def cmd_grant_access(client: Client, message: Message):
     try:
         await client.send_message(
             chat_id=target_id,
-            text=f"🎉 <b>Special Task Access Granted!</b>\nSuper Owner has provisioned <code>{assigned_count}</code> account IDs for your task execution. You can now use these accounts in Task Launcher!",
+            text=f"🎉 <b>Special Task Access Granted!</b>\nAdmin has provisioned <code>{assigned_count}</code> account IDs for your task execution. You can now use these accounts in Task Launcher!",
             parse_mode=enums.ParseMode.HTML
         )
     except Exception:
@@ -844,8 +842,8 @@ async def cmd_grant_access(client: Client, message: Message):
 async def cmd_revoke_access(client: Client, message: Message):
     user_id = message.from_user.id
     role = await db_mgr.get_user_role(user_id)
-    if role != "super_owner":
-        await message.reply_text("⚠️ <b>Clearance Denied:</b> This command requires Super Owner privileges.")
+    if role not in ["admin", "owner", "super_owner"]:
+        await message.reply_text("⚠️ <b>Clearance Denied:</b> Requires Admin/Owner privileges.")
         return
 
     parts = message.text.split()[1:]
@@ -857,7 +855,7 @@ async def cmd_revoke_access(client: Client, message: Message):
     await db_mgr.assignments.delete_many({"user_id": target_id})
     await message.reply_text(f"✨ Revoked all assigned account ID access from user <code>{target_id}</code>.", parse_mode=enums.ParseMode.HTML)
 
-# --- ADMINISTRATIVE CORRIDORS ---
+# --- ADMINISTRATIVE ROLE MANAGEMENT COMMANDS ---
 @app.on_message(filters.command("addadmin") & filters.private)
 async def cmd_add_admin(client: Client, message: Message):
     user_id = message.from_user.id
@@ -868,20 +866,19 @@ async def cmd_add_admin(client: Client, message: Message):
         
     parts = message.text.split()[1:]
     if not parts or not parts[0].isdigit():
-        await message.reply_text("✨ <b>Syntax Profile Map layout:</b> <code>/addadmin &lt;user_id&gt;</code>", parse_mode=enums.ParseMode.HTML)
+        await message.reply_text("✨ <b>Syntax:</b> <code>/addadmin &lt;user_id&gt;</code>", parse_mode=enums.ParseMode.HTML)
         return
         
     target_id = int(parts[0])
-    limit_val = 999999999
     
     await db_mgr.users.update_one(
         {"user_id": target_id},
-        {"$set": {"role": "admin", "max_accounts": limit_val}},
+        {"$set": {"role": "admin", "max_accounts": 999999999}},
         upsert=True
     )
         
     await message.reply_text(f"💎 <b>Success:</b> User <code>{target_id}</code> updated to Admin with unlimited account capacity.", parse_mode=enums.ParseMode.HTML)
-    await db_mgr.log_action(user_id, f"Made user {target_id} an Admin (unlimited)", client, operational=True)
+    await db_mgr.log_action(user_id, f"Made user {target_id} an Admin", client, operational=True)
 
 @app.on_message(filters.command("removeadmin") & filters.private)
 async def cmd_remove_admin(client: Client, message: Message):
@@ -893,7 +890,7 @@ async def cmd_remove_admin(client: Client, message: Message):
         
     parts = message.text.split()[1:]
     if not parts or not parts[0].isdigit():
-        await message.reply_text("✨ <b>Syntax Profile Map layout:</b> <code>/removeadmin &lt;user_id&gt;</code>", parse_mode=enums.ParseMode.HTML)
+        await message.reply_text("✨ <b>Syntax:</b> <code>/removeadmin &lt;user_id&gt;</code>", parse_mode=enums.ParseMode.HTML)
         return
         
     target_id = int(parts[0])
@@ -902,7 +899,7 @@ async def cmd_remove_admin(client: Client, message: Message):
     await message.reply_text(f"💎 <b>Success:</b> Authorization structural privileges revoked from Admin ID <code>{target_id}</code>.", parse_mode=enums.ParseMode.HTML)
     await db_mgr.log_action(user_id, f"Removed Admin role from user {target_id}", client, operational=True)
 
-# --- NEW ADMIN FEATURES: PURGE DATABASE & CHECK DB STORAGE ---
+# --- DATABASE PURGE & TELEMETRY COMMANDS ---
 @app.on_message(filters.command("purgedatabase") & filters.private)
 async def cmd_purge_database(client: Client, message: Message):
     user_id = message.from_user.id
@@ -993,6 +990,116 @@ async def process_text_and_media_messages(client: Client, message: Message):
     state, data = get_user_state(user_id)
 
     if not state:
+        return
+
+    # Grant access steps
+    if state == "waiting_for_grant_uid":
+        val = message.text.strip()
+        if not val.isdigit():
+            await message.reply_text("❌ Target User ID must be a numerical integer. Retry:")
+            return
+        
+        target_uid = int(val)
+        set_user_state(user_id, "waiting_for_grant_count", {"grant_target_uid": target_uid})
+        await message.reply_text(f"📱 <b>Enter account capacity count to grant for User ID <code>{target_uid}</code> (e.g. 20):</b>", parse_mode=enums.ParseMode.HTML)
+        return
+
+    if state == "waiting_for_grant_count":
+        val = message.text.strip()
+        if not val.isdigit():
+            await message.reply_text("❌ Count must be a positive integer. Retry:")
+            return
+        
+        count = int(val)
+        target_uid = data.get("grant_target_uid")
+        clear_user_state(user_id)
+
+        cursor = db_mgr.accounts.find({"status": "active"}).limit(count)
+        rows = [doc async for doc in cursor]
+
+        if not rows:
+            await message.reply_text("❌ No active accounts found in database to grant.")
+            return
+
+        assigned_count = 0
+        for row in rows:
+            ph = row["phone"]
+            try:
+                await db_mgr.assignments.update_one(
+                    {"user_id": target_uid, "phone": ph},
+                    {"$setOnInsert": {"user_id": target_uid, "phone": ph}},
+                    upsert=True
+                )
+                assigned_count += 1
+            except Exception:
+                pass
+
+        await message.reply_text(
+            f"👑 <b>Access Provisioned Successfully!</b>\n\n"
+            f"👤 Target User ID: <code>{target_uid}</code>\n"
+            f"📱 Granted IDs Allocation: <code>{assigned_count}</code> active accounts\n"
+            f"🔒 <i>Note: This user can ONLY execute tasks using these IDs and CANNOT export session strings.</i>",
+            parse_mode=enums.ParseMode.HTML
+        )
+
+        try:
+            await client.send_message(
+                chat_id=target_uid,
+                text=f"🎉 <b>Special Task Access Granted!</b>\nAdmin has provisioned <code>{assigned_count}</code> account IDs for your task execution. You can now use these accounts in Task Launcher!",
+                parse_mode=enums.ParseMode.HTML
+            )
+        except Exception:
+            pass
+        return
+
+    # Reset access steps
+    if state == "waiting_for_reset_uid":
+        val = message.text.strip()
+        if not val.isdigit():
+            await message.reply_text("❌ Target User ID must be a numerical integer. Retry:")
+            return
+        
+        target_uid = int(val)
+        clear_user_state(user_id)
+        
+        await db_mgr.assignments.delete_many({"user_id": target_uid})
+        await message.reply_text(f"✨ <b>Reset Complete!</b> All assigned account ID access has been revoked for User ID <code>{target_uid}</code>.", parse_mode=enums.ParseMode.HTML)
+        return
+
+    # Promote Admin steps
+    if state == "waiting_for_addadmin_uid":
+        val = message.text.strip()
+        if not val.isdigit():
+            await message.reply_text("❌ User ID must be a numerical integer. Retry:")
+            return
+            
+        target_id = int(val)
+        clear_user_state(user_id)
+        
+        await db_mgr.users.update_one(
+            {"user_id": target_id},
+            {"$set": {"role": "admin", "max_accounts": 999999999}},
+            upsert=True
+        )
+            
+        await message.reply_text(f"💎 <b>Success:</b> User <code>{target_id}</code> updated to Admin with unlimited account capacity.", parse_mode=enums.ParseMode.HTML)
+        await db_mgr.log_action(user_id, f"Made user {target_id} an Admin", client, operational=True)
+        return
+
+    # Demote Admin steps
+    if state == "waiting_for_removeadmin_uid":
+        val = message.text.strip()
+        if not val.isdigit():
+            await message.reply_text("❌ User ID must be a numerical integer. Retry:")
+            return
+            
+        target_id = int(val)
+        clear_user_state(user_id)
+        
+        await db_mgr.users.update_one({"user_id": target_id}, {"$set": {"role": "user"}})
+            
+        await message.reply_text(f"💎 <b>Success:</b> Authorization structural privileges revoked from Admin ID <code>{target_id}</code>.", parse_mode=enums.ParseMode.HTML)
+        await db_mgr.log_action(user_id, f"Removed Admin role from user {target_id}", client, operational=True)
         return
 
     # Broadcast handler
@@ -1234,7 +1341,7 @@ async def process_text_and_media_messages(client: Client, message: Message):
         
         if role == "super_owner" and account_routing == "all":
             max_available = await db_mgr.accounts.count_documents({"status": "active"})
-        elif role == "owner":
+        elif role in ["owner", "admin"]:
             max_available = await db_mgr.accounts.count_documents({"status": "active"})
         else:
             assigned_phones = [doc["phone"] async for doc in db_mgr.assignments.find({"user_id": user_id})]
@@ -1653,7 +1760,7 @@ async def task_hub_select_type(client: Client, callback: CallbackQuery):
     clear_user_state(user_id)
     
     role = await db_mgr.get_user_role(user_id)
-    if role in ["owner", "super_owner"]:
+    if role in ["owner", "super_owner", "admin"]:
         active_count = await db_mgr.accounts.count_documents({"status": "active"})
     else:
         assigned_phones = [doc["phone"] async for doc in db_mgr.assignments.find({"user_id": user_id})]
@@ -1835,6 +1942,7 @@ async def handle_view_referrals(client: Client, callback: CallbackQuery):
     buttons = [[InlineKeyboardButton(text="💎 Home Menu", callback_data="main_menu")]]
     await callback.message.edit_text(text=text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode=enums.ParseMode.HTML)
 
+# --- ENHANCED INTERACTIVE ADMIN PANEL ---
 @app.on_callback_query(filters.regex("^admin_panel$"))
 async def handle_admin_panel(client: Client, callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -1850,7 +1958,10 @@ async def handle_admin_panel(client: Client, callback: CallbackQuery):
         f"Your system role: <b>{role.upper()}</b>\n"
         f"Select system administrative action below:"
     )
+    
     buttons = [
+        [InlineKeyboardButton(text="🔑 Grant Account Access", callback_data="btn_grant_access_start"), InlineKeyboardButton(text="🔄 Reset Account Access", callback_data="btn_reset_access_start")],
+        [InlineKeyboardButton(text="👑 Promote Admin", callback_data="btn_add_admin_start"), InlineKeyboardButton(text="📉 Demote Admin", callback_data="btn_remove_admin_start")],
         [InlineKeyboardButton(text="💾 Database Storage Telemetry", callback_data="btn_db_storage")],
         [InlineKeyboardButton(text="📢 Global User Broadcast", callback_data="btn_start_broadcast")],
         [InlineKeyboardButton(text="🛑 Abort All Tasks", callback_data="btn_abort_all_tasks")],
@@ -1858,6 +1969,42 @@ async def handle_admin_panel(client: Client, callback: CallbackQuery):
         [InlineKeyboardButton(text="💎 Home Menu", callback_data="main_menu")]
     ]
     await callback.message.edit_text(text=text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode=enums.ParseMode.HTML)
+
+@app.on_callback_query(filters.regex("^btn_grant_access_start$"))
+async def handle_btn_grant_access_start(client: Client, callback: CallbackQuery):
+    await callback.answer()
+    user_id = callback.from_user.id
+    set_user_state(user_id, "waiting_for_grant_uid")
+    await callback.message.edit_text("👤 <b>Enter Target User ID to Grant Access:</b>\n<i>(Or send command <code>/grantaccess &lt;user_id&gt; [count]</code>)</i>", parse_mode=enums.ParseMode.HTML)
+
+@app.on_callback_query(filters.regex("^btn_reset_access_start$"))
+async def handle_btn_reset_access_start(client: Client, callback: CallbackQuery):
+    await callback.answer()
+    user_id = callback.from_user.id
+    set_user_state(user_id, "waiting_for_reset_uid")
+    await callback.message.edit_text("🔄 <b>Enter Target User ID to Reset / Revoke Access:</b>\n<i>(Or send command <code>/revokeaccess &lt;user_id&gt;</code>)</i>", parse_mode=enums.ParseMode.HTML)
+
+@app.on_callback_query(filters.regex("^btn_add_admin_start$"))
+async def handle_btn_add_admin_start(client: Client, callback: CallbackQuery):
+    user_id = callback.from_user.id
+    role = await db_mgr.get_user_role(user_id)
+    if role not in ["owner", "super_owner"]:
+        await callback.answer("⚠️ Only Super Owner or Owner can promote admins.", show_alert=True)
+        return
+    await callback.answer()
+    set_user_state(user_id, "waiting_for_addadmin_uid")
+    await callback.message.edit_text("👑 <b>Enter Target User ID to Promote to Admin:</b>\n<i>(Or send command <code>/addadmin &lt;user_id&gt;</code>)</i>", parse_mode=enums.ParseMode.HTML)
+
+@app.on_callback_query(filters.regex("^btn_remove_admin_start$"))
+async def handle_btn_remove_admin_start(client: Client, callback: CallbackQuery):
+    user_id = callback.from_user.id
+    role = await db_mgr.get_user_role(user_id)
+    if role not in ["owner", "super_owner"]:
+        await callback.answer("⚠️ Only Super Owner or Owner can demote admins.", show_alert=True)
+        return
+    await callback.answer()
+    set_user_state(user_id, "waiting_for_removeadmin_uid")
+    await callback.message.edit_text("📉 <b>Enter Target Admin User ID to Demote:</b>\n<i>(Or send command <code>/removeadmin &lt;user_id&gt;</code>)</i>", parse_mode=enums.ParseMode.HTML)
 
 @app.on_callback_query(filters.regex("^btn_db_storage$"))
 async def handle_btn_db_storage(client: Client, callback: CallbackQuery):
