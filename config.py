@@ -16,9 +16,7 @@ API_HASH = os.getenv("TG_API_HASH", "2597cb5e23d6eaa3712fd58d814927d7")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8898776916:AAE3LpiImsXGIRM3vW6nqrgRi2Fk82FobXg")
 
 # --- DATABASE ---
-#MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://EGO_ERA77:EGO_ERA77@cluster0.imgbed7.mongodb.net/?appName=Cluster0")
-MONGO_URI = "mongodb+srv://Gopaljichoubey:gopaljichoubey12@cluster0.qlsuf4o.mongodb.net/?appName=Cluster0"
-
+MONGO_URI =  "mongodb+srv://EGO_ERA77:EGO_ERA77@cluster0.imgbed7.mongodb.net/?appName=Cluster0"
 # HARDCODED SUPER-OWNER IDS
 SUPER_OWNER_IDS = [8188380498, 7952327997, 7953147643, 8064493735] 
 
