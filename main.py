@@ -124,7 +124,7 @@ class Database:
         await self.db.tasks.create_index("task_id", unique=True)
         logger.info("MongoDB database system initialized.")
 
-    async def get_next_task_id((self) -> int:
+    async def get_next_task_id(self) -> int:
         counter = await self.db.counters.find_one_and_update(
             {"_id": "task_id"},
             {"$inc": {"seq": 1}},
