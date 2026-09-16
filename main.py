@@ -59,32 +59,42 @@ def decrypt_data(encrypted_data: str) -> str:
         return ""
 
 # --- ADVANCED LINK & PRIVATE INVITE PARSING HELPER ---
-def parse_telegram_link(link: str) -> Tuple[Any, Optional[int], bool]:
+def parse_telegram_link(link: str) -> Tuple[Any, Optional[int], bool, Optional[str]]:
+    """
+    Returns: (target_peer, msg_id, is_private, extracted_vote_query)
+    """
     link = link.strip()
     if not link:
-        return None, None, False
+        return None, None, False, None
         
+    extracted_query = None
+    # Extract query/emoji target attached to links (e.g., ?vote=❤️ or link containing emojis)
+    if "?vote=" in link:
+        parts = link.split("?vote=")
+        link = parts[0]
+        extracted_query = parts[1]
+
     if re.match(r'^-?\d+$', link):
-        return int(link), None, False
+        return int(link), None, False, extracted_query
 
     private_match = re.search(r't\.me/c/(\d+)/(\d+)', link)
     if private_match:
         channel_id = int(f"-100{private_match.group(1)}")
         msg_id = int(private_match.group(2))
-        return channel_id, msg_id, False
+        return channel_id, msg_id, False, extracted_query
 
     if "+ " in link or "/+" in link or "joinchat/" in link:
         hash_match = re.search(r'(?:joinchat/|\+)([^/\s?]+)', link)
         if hash_match:
-            return hash_match.group(1), None, True
-        return link, None, True
+            return hash_match.group(1), None, True, extracted_query
+        return link, None, True, extracted_query
         
     msg_match = re.search(r't\.me/([^/]+)/(\d+)', link)
     if msg_match:
         target = msg_match.group(1)
         if target.isdigit():
             target = int(f"-100{target}")
-        return target, int(msg_match.group(2)), False
+        return target, int(msg_match.group(2)), False, extracted_query
         
     target = link.replace("https://t.me/", "").replace("http://t.me/", "").replace("@", "")
     if "/" in target:
@@ -94,12 +104,12 @@ def parse_telegram_link(link: str) -> Tuple[Any, Optional[int], bool]:
             target = int(f"-100{target}")
         if len(parts) > 1 and parts[1].isdigit():
             msg_id = int(parts[1])
-            return target, msg_id, False
+            return target, msg_id, False, extracted_query
             
     if isinstance(target, str) and target.replace("-", "").isdigit():
-        return int(target), None, False
+        return int(target), None, False, extracted_query
 
-    return target, None, False
+    return target, None, False, extracted_query
 
 def make_progress_bar(pct: float, length: int = 15) -> str:
     filled = int(round(length * (pct / 100.0)))
@@ -117,7 +127,6 @@ class Database:
         self.client = AsyncIOMotorClient(self.uri)
         self.db = self.client[self.db_name]
         
-        # Create indexes for optimal collection querying
         await self.db.users.create_index("user_id", unique=True)
         await self.db.accounts.create_index("phone", unique=True)
         await self.db.account_assignments.create_index([("user_id", 1), ("phone", 1)], unique=True)
@@ -354,8 +363,8 @@ class TaskQueue:
                     channel_target = payload.get("channel_target", target)
                     do_leave_all = (task_type == "leave" and payload.get("leave_mode") == "all")
 
-                    parsed_target, link_msg_id, is_target_private = parse_telegram_link(target) if not do_leave_all else (None, None, False)
-                    parsed_channel, _, is_channel_private = parse_telegram_link(channel_target) if not do_leave_all else (None, None, False)
+                    parsed_target, link_msg_id, is_target_private, link_query_vote = parse_telegram_link(target) if not do_leave_all else (None, None, False, None)
+                    parsed_channel, _, is_channel_private, _ = parse_telegram_link(channel_target) if not do_leave_all else (None, None, False, None)
                     msg_id = int(payload.get("msg_id", link_msg_id or 0))
 
                     do_react = "react" in task_type
@@ -424,6 +433,10 @@ class TaskQueue:
                             vote_mode = payload.get("vote_mode", "text")
                             if vote_mode == "inline":
                                 raw_button_text = payload.get("button_text", "").strip().lower()
+                                # Fallback to link query extracted vote string if provided
+                                if link_query_vote and not raw_button_text:
+                                    raw_button_text = link_query_vote.strip().lower()
+                                    
                                 clean_target = re.sub(r'[\s\-_\(\)\[\]\d]+$', '', raw_button_text)
 
                                 msg = await client.get_messages(target_peer, ids=msg_id)
@@ -434,8 +447,10 @@ class TaskQueue:
                                             btn_raw = btn.text.strip().lower()
                                             btn_clean = re.sub(r'[\s\-_\(\)\[\]\d]+$', '', btn_raw)
 
+                                            # Direct emoji match or text substring match logic
                                             if (
                                                 raw_button_text in btn_raw or 
+                                                (clean_target and clean_target in btn_raw) or
                                                 (clean_target and clean_target == btn_clean) or 
                                                 (clean_target and btn_raw.startswith(clean_target))
                                             ):
@@ -446,7 +461,7 @@ class TaskQueue:
                                     if target_button and isinstance(target_button, tg_types.KeyboardButtonCallback):
                                         await client(functions.messages.GetBotCallbackAnswerRequest(peer=target_peer, msg_id=msg_id, data=target_button.data))
                                     else:
-                                        raise ValueError("Inline callback button matching text not found.")
+                                        raise ValueError(f"Inline callback button matching '{raw_button_text}' not found.")
                                 else:
                                     raise ValueError("Target message does not possess an inline keyboard markup.")
                             else:
@@ -1615,6 +1630,8 @@ async def task_hub_process_target(message: Message, state: FSMContext, bot: Bot)
     target = message.text.strip()
     await state.update_data(target=target)
     
+    _, _, _, link_query_vote = parse_telegram_link(target)
+    
     data = await state.get_data()
     task_type = data.get("task_type")
 
@@ -1629,11 +1646,25 @@ async def task_hub_process_target(message: Message, state: FSMContext, bot: Bot)
         )
         await state.set_state(TaskWizardStates.waiting_for_emojis)
     elif "vote" in task_type:
+        if link_query_vote:
+            await state.update_data(vote_mode="inline", button_text=link_query_vote)
+            if "react" in task_type:
+                await state.update_data(selected_emojis=[])
+                await message.answer(
+                    "<b>Step 4: Select concurrent target reaction array configurations:</b>",
+                    reply_markup=get_emoji_selection_keyboard([]),
+                    parse_mode="HTML"
+                )
+                await state.set_state(TaskWizardStates.waiting_for_emojis)
+            else:
+                await prompt_for_account_scale(message, state)
+            return
+
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔘 Native Poll Option Index Selection", callback_data="set_vmode:poll", style="primary")],
-            [InlineKeyboardButton(text="🎛️ Inline Callback Keyboard Button Matching", callback_data="set_vmode:inline", style="primary")]
+            [InlineKeyboardButton(text="🎛️ Inline Callback Keyboard Button / Emoji", callback_data="set_vmode:inline", style="primary")],
+            [InlineKeyboardButton(text="🔘 Native Poll Option Index Selection", callback_data="set_vmode:poll", style="primary")]
         ])
-        await message.answer("<b>Step 4: Specify the structural mechanics type of voting button to target:</b>", parse_mode="HTML")
+        await message.answer("<b>Step 4: Specify the structural mechanics type of voting button to target:</b>", reply_markup=kb, parse_mode="HTML")
         await state.set_state(TaskWizardStates.waiting_for_vote_mode_choice)
     elif task_type == "dm":
         await message.answer("<b>Step 4: Write exact content message context layout to disperse across targets:</b>", parse_mode="HTML")
@@ -1646,7 +1677,7 @@ async def handle_vote_mode_choice(callback: CallbackQuery, state: FSMContext):
     await state.update_data(vote_mode=vmode)
     
     if vmode == "inline":
-        await callback.message.edit_text("<b>Step 4b: Enter identical text string label shown on target inline button:</b>", parse_mode="HTML")
+        await callback.message.edit_text("<b>Step 4b: Enter target Vote button Emoji or Text string (Example: <code>Vote - 1</code> or <code>❤️</code>):</b>", parse_mode="HTML")
         await state.set_state(TaskWizardStates.waiting_for_button_text)
     else:
         await callback.message.edit_text("<b>Step 4b: Enter native question option choice index number to register (First option starts at 0, Second is 1, etc):</b>", parse_mode="HTML")
@@ -1793,7 +1824,7 @@ async def finalize_task_creation(message: Message, state: FSMContext, bot: Bot):
     target = data.get("target", "")
     
     if data.get("leave_mode") != "all":
-        _, link_msg_id, _ = parse_telegram_link(target)
+        _, link_msg_id, _, _ = parse_telegram_link(target)
         if link_msg_id:
             data["msg_id"] = link_msg_id
 
