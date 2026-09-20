@@ -370,7 +370,7 @@ class TaskQueue:
                     do_react = "react" in task_type
                     do_vote = "vote" in task_type
                     do_view = "view" in task_type or task_type == "speed"
-                    do_join = (task_type == "join" or do_react or do_vote or do_view) and not do_leave_all
+                    do_join = (task_type == "join" or do_react or do_view) and not do_vote and not do_leave_all
                     do_leave = task_type == "leave"
                     do_dm = task_type == "dm"
                     do_refer = task_type == "refer"
@@ -431,42 +431,62 @@ class TaskQueue:
                     if do_vote and msg_id:
                         try:
                             vote_mode = payload.get("vote_mode", "text")
-                            if vote_mode == "inline":
-                                raw_button_text = payload.get("button_text", "").strip().lower()
-                                # Fallback to link query extracted vote string if provided
-                                if link_query_vote and not raw_button_text:
-                                    raw_button_text = link_query_vote.strip().lower()
-                                    
-                                clean_target = re.sub(r'[\s\-_\(\)\[\]\d]+$', '', raw_button_text)
+                            
+                            async def perform_vote():
+                                if vote_mode == "inline":
+                                    raw_button_text = payload.get("button_text", "").strip().lower()
+                                    if link_query_vote and not raw_button_text:
+                                        raw_button_text = link_query_vote.strip().lower()
+                                        
+                                    clean_target = re.sub(r'[\s\-_\(\)\[\]\d]+$', '', raw_button_text)
 
-                                msg = await client.get_messages(target_peer, ids=msg_id)
-                                if msg and msg.reply_markup:
-                                    target_button = None
-                                    for row in msg.reply_markup.rows:
-                                        for btn in row.buttons:
-                                            btn_raw = btn.text.strip().lower()
-                                            btn_clean = re.sub(r'[\s\-_\(\)\[\]\d]+$', '', btn_raw)
+                                    msg = await client.get_messages(target_peer, ids=msg_id)
+                                    if msg and msg.reply_markup:
+                                        target_button = None
+                                        for row in msg.reply_markup.rows:
+                                            for btn in row.buttons:
+                                                btn_raw = btn.text.strip().lower()
+                                                btn_clean = re.sub(r'[\s\-_\(\)\[\]\d]+$', '', btn_raw)
 
-                                            # Direct emoji match or text substring match logic
-                                            if (
-                                                raw_button_text in btn_raw or 
-                                                (clean_target and clean_target in btn_raw) or
-                                                (clean_target and clean_target == btn_clean) or 
-                                                (clean_target and btn_raw.startswith(clean_target))
-                                            ):
-                                                target_button = btn
+                                                if (
+                                                    raw_button_text in btn_raw or 
+                                                    (clean_target and clean_target in btn_raw) or
+                                                    (clean_target and clean_target == btn_clean) or 
+                                                    (clean_target and btn_raw.startswith(clean_target))
+                                                ):
+                                                    target_button = btn
+                                                    break
+                                            if target_button:
                                                 break
-                                        if target_button:
-                                            break
-                                    if target_button and isinstance(target_button, tg_types.KeyboardButtonCallback):
-                                        await client(functions.messages.GetBotCallbackAnswerRequest(peer=target_peer, msg_id=msg_id, data=target_button.data))
+                                        if target_button and isinstance(target_button, tg_types.KeyboardButtonCallback):
+                                            await client(functions.messages.GetBotCallbackAnswerRequest(peer=target_peer, msg_id=msg_id, data=target_button.data))
+                                        else:
+                                            raise ValueError(f"Inline callback button matching '{raw_button_text}' not found.")
                                     else:
-                                        raise ValueError(f"Inline callback button matching '{raw_button_text}' not found.")
+                                        raise ValueError("Target message does not possess an inline keyboard markup.")
                                 else:
-                                    raise ValueError("Target message does not possess an inline keyboard markup.")
-                            else:
-                                chosen_option = int(payload.get("poll_option_index", 0))
-                                await client(functions.messages.VotePollRequest(peer=target_peer, msg_id=msg_id, options=[bytes([chosen_option])]))
+                                    chosen_option = int(payload.get("poll_option_index", 0))
+                                    await client(functions.messages.VotePollRequest(peer=target_peer, msg_id=msg_id, options=[bytes([chosen_option])]))
+
+                            try:
+                                await perform_vote()
+                            except Exception as first_vote_err:
+                                # Auto-join channel if non-member and retry vote
+                                try:
+                                    if is_channel_private or "+ " in str(channel_target) or "/+" in str(channel_target) or "joinchat/" in str(channel_target):
+                                        invite_hash = parsed_channel if is_channel_private else parsed_target
+                                        updates = await client(functions.messages.ImportChatInviteRequest(hash=str(invite_hash).strip()))
+                                        if hasattr(updates, 'chats') and updates.chats:
+                                            target_peer = updates.chats[0]
+                                    else:
+                                        updates = await client(functions.channels.JoinChannelRequest(channel=parsed_channel or parsed_target))
+                                        if hasattr(updates, 'chats') and updates.chats:
+                                            target_peer = updates.chats[0]
+                                    await asyncio.sleep(1)
+                                    await perform_vote()
+                                except Exception:
+                                    raise first_vote_err
+
                         except Exception as vote_err:
                             failed_ids.append((phone, f"Voting failed: {str(vote_err)}"))
                             failure_counter += 1
@@ -1664,7 +1684,7 @@ async def task_hub_process_target(message: Message, state: FSMContext, bot: Bot)
             [InlineKeyboardButton(text="🎛️ Inline Callback Keyboard Button / Emoji", callback_data="set_vmode:inline", style="primary")],
             [InlineKeyboardButton(text="🔘 Native Poll Option Index Selection", callback_data="set_vmode:poll", style="primary")]
         ])
-        await message.answer("<b>Step 4: Specify the structural mechanics type of voting button to target:</b>", reply_markup=kb, parse_mode="HTML")
+        await message.answer("<b>Step 4: Specify the structural mechanics type of voting button to target:</b>", parse_mode="HTML")
         await state.set_state(TaskWizardStates.waiting_for_vote_mode_choice)
     elif task_type == "dm":
         await message.answer("<b>Step 4: Write exact content message context layout to disperse across targets:</b>", parse_mode="HTML")
