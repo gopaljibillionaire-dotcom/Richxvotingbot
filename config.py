@@ -11,7 +11,7 @@ logging.basicConfig(
 logger = logging.getLogger("MultiAccountSystem")
 
 # --- CREDENTIALS ---
-API_ID = int(os.getenv("TG_API_ID", "30861364"))
+API_ID = int(os.getenv("TG_API_ID", ""))
 API_HASH = os.getenv("TG_API_HASH", "2597cb5e23d6eaa3712fd58d814927d7")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8898776916:AAF-qPIGFX30gSZcmuI9M6NOdT0OYHQiRYY")
 
