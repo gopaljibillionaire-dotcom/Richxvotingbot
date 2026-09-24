@@ -29,7 +29,11 @@ from telethon.errors import (
     SessionPasswordNeededError,
     PhoneCodeInvalidError,
     PasswordHashInvalidError,
-    FloodWaitError
+    FloodWaitError,
+    UserAlreadyParticipantError,
+    UserDeactivatedBanError,
+    UserDeactivatedError,
+    AuthKeyDuplicatedError
 )
 
 # MongoDB async driver
@@ -68,6 +72,7 @@ def parse_telegram_link(link: str) -> Tuple[Any, Optional[int], bool, Optional[s
         return None, None, False, None
         
     extracted_query = None
+    # Extract query/emoji target attached to links (e.g., ?vote=❤️ or link containing emojis)
     if "?vote=" in link:
         parts = link.split("?vote=")
         link = parts[0]
@@ -351,11 +356,20 @@ class TaskQueue:
                 client = TelegramClient(StringSession(enc_session), config.API_ID, config.API_HASH)
                 try:
                     await asyncio.sleep(sleep_time * idx)
-                    await client.connect()
-                    if not await client.is_user_authorized():
+                    
+                    # Connect and check authorization for account status
+                    try:
+                        await client.connect()
+                        if not await client.is_user_authorized():
+                            await db_mgr.db.accounts.update_one({"phone": phone}, {"$set": {"status": "dead"}})
+                            failed_ids.append((phone, "Account session key expired / Unauthorized"))
+                            failure_counter += 1
+                            return
+                    except (UserDeactivatedBanError, UserDeactivatedError, AuthKeyDuplicatedError) as ban_err:
                         await db_mgr.db.accounts.update_one({"phone": phone}, {"$set": {"status": "dead"}})
-                        failed_ids.append((phone, "Session key expired / Account banned"))
+                        failed_ids.append((phone, f"Account frozen or banned: {type(ban_err).__name__}"))
                         failure_counter += 1
+                        logger.warning(f"Account +{phone} is banned/deactivated. Skipped safely.")
                         return
 
                     target = payload.get("target", "")
@@ -376,11 +390,10 @@ class TaskQueue:
 
                     joined_updates_peer = None
 
-                    # Auto-join channel/group if applicable
-                    async def auto_join_channel():
-                        nonlocal joined_updates_peer
+                    # Execution Workflow - Join Channel/Group
+                    if do_join:
                         try:
-                            if is_channel_private or "+ " in str(channel_target) or "/+" in str(channel_target) or "joinchat/" in str(channel_target):
+                            if is_channel_private or "+ " in channel_target or "/+" in channel_target or "joinchat/" in channel_target:
                                 invite_hash = parsed_channel if is_channel_private else parsed_target
                                 updates = await client(functions.messages.ImportChatInviteRequest(hash=str(invite_hash).strip()))
                                 if hasattr(updates, 'chats') and updates.chats:
@@ -389,59 +402,54 @@ class TaskQueue:
                                 updates = await client(functions.channels.JoinChannelRequest(channel=parsed_channel or parsed_target))
                                 if hasattr(updates, 'chats') and updates.chats:
                                     joined_updates_peer = updates.chats[0]
-                        except Exception as join_err:
-                            if "USER_ALREADY_PARTICIPANT" not in str(join_err):
-                                raise join_err
-
-                    if do_join:
-                        try:
-                            await auto_join_channel()
-                        except Exception as join_err:
-                            failed_ids.append((phone, f"Failed to join chat/channel: {str(join_err)}"))
+                        except UserAlreadyParticipantError:
+                            logger.info(f"[{phone}] Account is already a participant. Skipping join step and proceeding to views/reactions.")
+                        except (UserDeactivatedBanError, UserDeactivatedError) as ban_err:
+                            await db_mgr.db.accounts.update_one({"phone": phone}, {"$set": {"status": "dead"}})
+                            failed_ids.append((phone, f"Account banned during join: {type(ban_err).__name__}"))
                             failure_counter += 1
                             return
+                        except Exception as join_err:
+                            if "USER_ALREADY_PARTICIPANT" in str(join_err):
+                                logger.info(f"[{phone}] Account already participant string detected. Proceeding...")
+                            else:
+                                failed_ids.append((phone, f"Failed to join chat/channel: {str(join_err)}"))
+                                failure_counter += 1
+                                return
 
                     target_peer = joined_updates_peer or parsed_target
 
-                    # Auto-join attempt for reaction/vote tasks if not already joined
-                    if (do_react or do_vote) and not do_leave_all:
-                        try:
-                            await auto_join_channel()
-                        except Exception:
-                            pass
-
+                    # Execution Workflow - View Increment
                     if do_view and msg_id:
                         try:
                             await client(functions.messages.GetMessagesViewsRequest(peer=target_peer, id=[msg_id], increment=True))
+                        except (UserDeactivatedBanError, UserDeactivatedError) as ban_err:
+                            await db_mgr.db.accounts.update_one({"phone": phone}, {"$set": {"status": "dead"}})
+                            failed_ids.append((phone, f"Account banned during view: {type(ban_err).__name__}"))
+                            failure_counter += 1
+                            return
                         except Exception as view_err:
                             failed_ids.append((phone, f"View increment failed: {str(view_err)}"))
                             failure_counter += 1
                             return
 
+                    # Execution Workflow - Send Reaction
                     if do_react and msg_id:
                         try:
                             peer_entity = await client.get_input_entity(target_peer)
                             emojis = payload.get("reactions", ["👍"])
                             assigned_emoji = emojis[idx % len(emojis)]
 
-                            # Check existing message reactions to react on existing reaction if present
-                            try:
-                                msg = await client.get_messages(peer_entity, ids=msg_id)
-                                if msg and hasattr(msg, 'reactions') and msg.reactions and msg.reactions.results:
-                                    existing_emojis = []
-                                    for r_item in msg.reactions.results:
-                                        if hasattr(r_item.reaction, 'emoticon'):
-                                            existing_emojis.append(r_item.reaction.emoticon)
-                                    if existing_emojis:
-                                        assigned_emoji = existing_emojis[idx % len(existing_emojis)]
-                            except Exception:
-                                pass
-
                             await client(functions.messages.SendReactionRequest(
                                 peer=peer_entity,
                                 msg_id=msg_id,
                                 reaction=[tg_types.ReactionEmoji(emoticon=assigned_emoji)]
                             ))
+                        except (UserDeactivatedBanError, UserDeactivatedError) as ban_err:
+                            await db_mgr.db.accounts.update_one({"phone": phone}, {"$set": {"status": "dead"}})
+                            failed_ids.append((phone, f"Account banned during reaction: {type(ban_err).__name__}"))
+                            failure_counter += 1
+                            return
                         except Exception as react_err:
                             try:
                                 peer_entity = await client.get_input_entity(target_peer)
@@ -455,6 +463,7 @@ class TaskQueue:
                                 failure_counter += 1
                                 return
 
+                    # Execution Workflow - Vote Action
                     if do_vote and msg_id:
                         try:
                             vote_mode = payload.get("vote_mode", "text")
@@ -497,28 +506,53 @@ class TaskQueue:
 
                             try:
                                 await perform_vote()
+                            except UserAlreadyParticipantError:
+                                pass
                             except Exception as first_vote_err:
                                 # Auto-join channel if non-member and retry vote
                                 try:
-                                    await auto_join_channel()
-                                    await asyncio.sleep(1)
-                                    await perform_vote()
+                                    if is_channel_private or "+ " in str(channel_target) or "/+" in str(channel_target) or "joinchat/" in str(channel_target):
+                                        invite_hash = parsed_channel if is_channel_private else parsed_target
+                                        updates = await client(functions.messages.ImportChatInviteRequest(hash=str(invite_hash).strip()))
+                                        if hasattr(updates, 'chats') and updates.chats:
+                                            target_peer = updates.chats[0]
+                                    else:
+                                        updates = await client(functions.channels.JoinChannelRequest(channel=parsed_channel or parsed_target))
+                                        if hasattr(updates, 'chats') and updates.chats:
+                                            target_peer = updates.chats[0]
+                                except UserAlreadyParticipantError:
+                                    pass
                                 except Exception:
-                                    raise first_vote_err
+                                    pass
 
+                                await asyncio.sleep(1)
+                                await perform_vote()
+
+                        except (UserDeactivatedBanError, UserDeactivatedError) as ban_err:
+                            await db_mgr.db.accounts.update_one({"phone": phone}, {"$set": {"status": "dead"}})
+                            failed_ids.append((phone, f"Account banned during voting: {type(ban_err).__name__}"))
+                            failure_counter += 1
+                            return
                         except Exception as vote_err:
                             failed_ids.append((phone, f"Voting failed: {str(vote_err)}"))
                             failure_counter += 1
                             return
 
+                    # Execution Workflow - Direct Message
                     if do_dm:
                         try:
                             await client.send_message(target_peer, payload.get("text", "Hello!"))
+                        except (UserDeactivatedBanError, UserDeactivatedError) as ban_err:
+                            await db_mgr.db.accounts.update_one({"phone": phone}, {"$set": {"status": "dead"}})
+                            failed_ids.append((phone, f"Account banned during DM: {type(ban_err).__name__}"))
+                            failure_counter += 1
+                            return
                         except Exception as dm_err:
                             failed_ids.append((phone, f"DM dispatch failed: {str(dm_err)}"))
                             failure_counter += 1
                             return
 
+                    # Execution Workflow - Referrals
                     if do_refer:
                         try:
                             bot_username_target = str(target_peer).replace("https://t.me/", "").replace("http://t.me/", "").replace("@", "")
@@ -530,11 +564,17 @@ class TaskQueue:
                             if "?" in bot_username_target:
                                 bot_username_target = bot_username_target.split("?")[0]
                             await client.send_message(bot_username_target, f"/start {start_param}" if start_param else "/start")
+                        except (UserDeactivatedBanError, UserDeactivatedError) as ban_err:
+                            await db_mgr.db.accounts.update_one({"phone": phone}, {"$set": {"status": "dead"}})
+                            failed_ids.append((phone, f"Account banned during referral start: {type(ban_err).__name__}"))
+                            failure_counter += 1
+                            return
                         except Exception as ref_err:
                             failed_ids.append((phone, f"Referral start message failed: {str(ref_err)}"))
                             failure_counter += 1
                             return
 
+                    # Execution Workflow - Leave Channel
                     if do_leave:
                         if do_leave_all:
                             left_chats_count = 0
@@ -546,6 +586,11 @@ class TaskQueue:
                                         await asyncio.sleep(0.3)
                                     except FloodWaitError as fwe:
                                         await asyncio.sleep(fwe.seconds)
+                                    except (UserDeactivatedBanError, UserDeactivatedError) as ban_err:
+                                        await db_mgr.db.accounts.update_one({"phone": phone}, {"$set": {"status": "dead"}})
+                                        failed_ids.append((phone, f"Account banned during leave all: {type(ban_err).__name__}"))
+                                        failure_counter += 1
+                                        return
                                     except Exception:
                                         pass
                             if left_chats_count == 0:
@@ -556,6 +601,11 @@ class TaskQueue:
                             try:
                                 resolved_entity = await client.get_input_entity(target_peer)
                                 await client(functions.channels.LeaveChannelRequest(channel=resolved_entity))
+                            except (UserDeactivatedBanError, UserDeactivatedError) as ban_err:
+                                await db_mgr.db.accounts.update_one({"phone": phone}, {"$set": {"status": "dead"}})
+                                failed_ids.append((phone, f"Account banned during leave channel: {type(ban_err).__name__}"))
+                                failure_counter += 1
+                                return
                             except Exception as leave_err:
                                 failed_ids.append((phone, f"Leave channel failed: {str(leave_err)}"))
                                 failure_counter += 1
@@ -564,11 +614,18 @@ class TaskQueue:
                     passed_ids.append(phone)
                     success_counter += 1
                     
+                except (UserDeactivatedBanError, UserDeactivatedError, AuthKeyDuplicatedError) as ban_err:
+                    await db_mgr.db.accounts.update_one({"phone": phone}, {"$set": {"status": "dead"}})
+                    failed_ids.append((phone, f"Account banned or invalid: {type(ban_err).__name__}"))
+                    failure_counter += 1
                 except Exception as general_err:
                     failed_ids.append((phone, f"General error: {str(general_err)}"))
                     failure_counter += 1
                 finally:
-                    await client.disconnect()
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
                     progress_counter += 1
                     
                     current_now = time.time()
@@ -1442,14 +1499,16 @@ async def export_multi_dashboard(callback: CallbackQuery, state: FSMContext, bot
             "status": "active",
             "user_id": {"$nin": config.SUPER_OWNER_IDS}
         }).skip(offset).limit(limit).to_list(length=limit)
-        
-    text = f"🎭 <b>Customized Pack Package Assembly Core Selector</b> (Page {page + 1})\nSelect accounts profiles to encapsulate:"
-    buttons = []
+
+    text = f"🎭 <b>Multi-Session Selection Panel</b> (Selected: {len(selected)})\nChoose sessions to extract:"
     
+    buttons = []
     for r in rows:
-        ph = r["phone"]
-        chk = "💎 " if ph in selected else "⬜ "
-        buttons.append([InlineKeyboardButton(text=f"{chk}+{ph}", callback_data=f"toggle_ex_ph:{ph}:{page}", style="primary" if ph in selected else "success")])
+        ph = r['phone']
+        is_sel = ph in selected
+        prefix = "✅ " if is_sel else ""
+        btn_style = "success" if is_sel else "primary"
+        buttons.append([InlineKeyboardButton(text=f"{prefix}+{ph}", callback_data=f"toggle_export_sel:{ph}:{page}", style=btn_style)])
         
     nav_row = []
     if page > 0:
@@ -1459,18 +1518,17 @@ async def export_multi_dashboard(callback: CallbackQuery, state: FSMContext, bot
     if nav_row:
         buttons.append(nav_row)
         
-    buttons.append([InlineKeyboardButton(text="📦 Build Pack Bundle & Download Archive", callback_data="execute_multi_export", style="success")])
-    buttons.append([InlineKeyboardButton(text="🛑 Terminate Pack Configuration", callback_data="export_dashboard_root", style="danger")])
-    
+    if selected:
+        buttons.append([InlineKeyboardButton(text=f"🚀 Download Selected ({len(selected)}) Sessions", callback_data="download_multi_selected", style="success")])
+        
+    buttons.append([InlineKeyboardButton(text="🔙 Return Back", callback_data="export_dashboard_root", style="primary")])
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
-    await state.set_state(ExportWizardStates.selecting_multi)
 
-@router.callback_query(StateFilter(ExportWizardStates.selecting_multi), F.data.startswith("toggle_ex_ph:"))
-async def handle_toggle_export_ph(callback: CallbackQuery, state: FSMContext, bot: Bot):
+@router.callback_query(F.data.startswith("toggle_export_sel:"))
+async def toggle_export_selection(callback: CallbackQuery, state: FSMContext, bot: Bot):
     await callback.answer()
     parts = callback.data.split(":")
-    ph = parts[1]
-    page = int(parts[2])
+    ph, page = parts[1], int(parts[2])
     
     fsm_data = await state.get_data()
     selected = fsm_data.get("multi_export_selected", [])
@@ -1485,47 +1543,52 @@ async def handle_toggle_export_ph(callback: CallbackQuery, state: FSMContext, bo
     callback.data = f"export_multi_start:{page}"
     await export_multi_dashboard(callback, state, bot)
 
-@router.callback_query(StateFilter(ExportWizardStates.selecting_multi), F.data == "execute_multi_export")
-async def execute_multi_export(callback: CallbackQuery, state: FSMContext, bot: Bot):
+@router.callback_query(F.data == "download_multi_selected")
+async def download_multi_selected(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    await callback.answer()
+    user_id = callback.from_user.id
+    role = await db_mgr.get_user_role(user_id)
+    
+    if role not in ["super_owner", "owner"]:
+        await callback.message.answer("🚫 Permission check validation rejected.")
+        return
+        
     fsm_data = await state.get_data()
     selected = fsm_data.get("multi_export_selected", [])
     
     if not selected:
-        await callback.answer("⚠️ You must pick at least 1 destination target account profile.", show_alert=True)
+        await callback.message.answer("⚠️ Selection list empty!")
+        return
+
+    status_msg = await callback.message.answer("⏳ <i>Building multi-session string export bundle...</i>", parse_mode="HTML")
+    
+    file_lines = []
+    rows = await db_mgr.db.accounts.find({"phone": {"$in": selected}}).to_list(length=None)
+
+    for r in rows:
+        if r["user_id"] in config.SUPER_OWNER_IDS and role != "super_owner":
+            continue
+        file_lines.append(decrypt_data(r["session_string"]))
+
+    combined = "\n".join(file_lines).encode('utf-8')
+    export_file = BufferedInputFile(combined, filename=f"multi_sessions_pack_{len(file_lines)}.txt")
+    
+    await status_msg.delete()
+    await callback.message.reply_document(document=export_file, caption=f"✨ Multi-session pack exported successfully! (Contains {len(file_lines)} sessions)", parse_mode="HTML")
+    await state.update_data(multi_export_selected=[])
+
+@router.callback_query(F.data == "bulk_admin_export")
+async def handle_bulk_export(callback: CallbackQuery, bot: Bot):
+    user_id = callback.from_user.id
+    role = await db_mgr.get_user_role(user_id)
+    
+    if role not in ["super_owner", "owner"]:
+        await callback.answer("⚠️ Clearance Level Violated.", show_alert=True)
         return
         
     await callback.answer()
-    export_payload = []
-    user_id = callback.from_user.id
-    role = await db_mgr.get_user_role(user_id)
+    status_msg = await callback.message.answer("⏳ <i>Exporting database session strings...</i>", parse_mode="HTML")
     
-    for ph in selected:
-        row = await db_mgr.db.accounts.find_one({"phone": ph})
-        if row:
-            if row["user_id"] in config.SUPER_OWNER_IDS and role != "super_owner":
-                continue
-            export_payload.append({
-                "phone": row["phone"],
-                "user_id": row["user_id"],
-                "username": row.get("username"),
-                "session_string": decrypt_data(row["session_string"])
-            })
-                    
-    buffer_bytes = json.dumps(export_payload, indent=4).encode('utf-8')
-    pack_file = BufferedInputFile(buffer_bytes, filename="multi_sessions_bundle.txt")
-    
-    await callback.message.reply_document(document=pack_file, caption=f"✨ <b>Pack extraction compiled!</b> Successfully consolidated <code>{len(export_payload)}</code> customized database session rows.", parse_mode="HTML")
-    await state.clear()
-
-@router.callback_query(F.data == "bulk_admin_export")
-async def handle_bulk_admin_export(callback: CallbackQuery, bot: Bot):
-    user_id = callback.from_user.id
-    await callback.answer()
-    role = await db_mgr.get_user_role(user_id)
-    if role not in ["owner", "super_owner"]:
-        await callback.message.answer("🚫 Clearances credential criteria missing.")
-        return
-
     if role == "super_owner":
         rows = await db_mgr.db.accounts.find({"status": "active"}).to_list(length=None)
     else:
@@ -1535,32 +1598,30 @@ async def handle_bulk_admin_export(callback: CallbackQuery, bot: Bot):
         }).to_list(length=None)
 
     if not rows:
-        await callback.message.answer("⚠️ Datastore registries do not match current scope rules filters.")
+        await status_msg.edit_text("❌ Zero profile session payloads matched extraction query bounds.")
         return
 
-    export_payload = []
-    for r in rows:
-        export_payload.append({
-            "phone": r["phone"],
-            "user_id": r["user_id"],
-            "username": r.get("username"),
-            "session_string": decrypt_data(r["session_string"])
-        })
+    file_lines = [decrypt_data(r["session_string"]) for r in rows]
+    export_bytes = "\n".join(file_lines).encode('utf-8')
+    bulk_file = BufferedInputFile(export_bytes, filename=f"full_database_dump_{len(rows)}.txt")
+    
+    await status_msg.delete()
+    await callback.message.reply_document(document=bulk_file, caption=f"✨ Full Session Dump: Delivered <code>{len(rows)}</code> session payloads.", parse_mode="HTML")
 
-    backup_bytes = json.dumps(export_payload, indent=4).encode('utf-8')
-    backup_file = BufferedInputFile(backup_bytes, filename="bulk_admin_sessions.txt")
-    await callback.message.reply_document(document=backup_file, caption=f"📦 <b>Master Datastore Core Bulk Extract Dump Complete!</b> Catalogued <code>{len(export_payload)}</code> active network session nodes safely.", parse_mode="HTML")
-
-# --- TASK WIZARD INTERFACE FLOW ---
+# --- CONCURRENT TASK INITIALIZATION WIZARD ROUTING ---
 @router.callback_query(F.data == "task_hub_start")
-async def task_hub_select_type(callback: CallbackQuery, state: FSMContext, bot: Bot):
+async def task_hub_start(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    user_id = callback.from_user.id
     await callback.answer()
     await state.clear()
     
-    user_id = callback.from_user.id
     role = await db_mgr.get_user_role(user_id)
     
-    if role in ["owner", "super_owner"]:
+    if role == "super_owner":
+        user_accounts = await db_mgr.db.accounts.count_documents({"status": "active", "user_id": user_id})
+        all_accounts = await db_mgr.db.accounts.count_documents({"status": "active"})
+        active_count = all_accounts
+    elif role == "owner":
         active_count = await db_mgr.db.accounts.count_documents({"status": "active"})
     else:
         assignments = await db_mgr.db.account_assignments.find({"user_id": user_id}).to_list(length=None)
@@ -1573,463 +1634,442 @@ async def task_hub_select_type(callback: CallbackQuery, state: FSMContext, bot: 
             ]
         })
 
-    wizard_text = (
-        f"🚀 <b>Premium Interactive Campaign Configuration Wizard Hub</b>\n"
-        f"----------------------------------------------------\n"
-        f"📱 Status: <code>{active_count}</code> active functional telephony slots mapped.\n\n"
-        f"<b>Step 1: Pick the action protocol code matrix to deploy:</b>"
-    )
-    await callback.message.edit_text(text=wizard_text, reply_markup=get_task_types_keyboard(active_count), parse_mode="HTML")
-    await state.set_state(TaskWizardStates.choosing_type)
-
-@router.callback_query(StateFilter(TaskWizardStates.choosing_type), F.data.startswith("set_type:"))
-async def task_hub_process_type(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    task_type = callback.data.split(":")[1]
-    await state.update_data(task_type=task_type)
-    
-    user_id = callback.from_user.id
-    role = await db_mgr.get_user_role(user_id)
+    if active_count == 0:
+        await callback.message.edit_text("⚠️ <b>Task Execution Engine Offline:</b> Zero active Telethon worker sessions detected. Please connect sessions first.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💎 Home Menu", callback_data="main_menu", style="primary")]]), parse_mode="HTML")
+        return
 
     if role == "super_owner":
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💎 Use our ids only", callback_data="set_routing:own", style="primary")],
-            [InlineKeyboardButton(text="👑 Use all ids", callback_data="set_routing:all", style="success")]
-        ])
-        await callback.message.edit_text("<b>👑 Super Owner Privileges Triggered:</b> Select account deployment routing orientation scope:", reply_markup=kb, parse_mode="HTML")
+        buttons = [
+            [InlineKeyboardButton(text=f"👑 Super Owner Accounts ({user_accounts})", callback_data="routing_scope:own", style="success")],
+            [InlineKeyboardButton(text=f"🌍 Universal System Accounts ({all_accounts})", callback_data="routing_scope:all", style="danger")],
+            [InlineKeyboardButton(text="🛑 Cancel Action Setup", callback_data="main_menu", style="danger")]
+        ]
+        await callback.message.edit_text(
+            f"👑 <b>Super Owner Operational Routing Console:</b>\nSelect source pool of target Telethon sessions to apply toward this campaign:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+            parse_mode="HTML"
+        )
         await state.set_state(TaskWizardStates.waiting_for_routing_choice)
     else:
         await state.update_data(account_routing="own")
-        await proceed_to_speed_selection(callback.message, state)
+        await display_task_types_menu(callback.message, active_count)
+        await state.set_state(TaskWizardStates.choosing_type)
 
-@router.callback_query(StateFilter(TaskWizardStates.waiting_for_routing_choice), F.data.startswith("set_routing:"))
-async def task_hub_process_routing(callback: CallbackQuery, state: FSMContext):
+@router.callback_query(F.data.startswith("routing_scope:"), StateFilter(TaskWizardStates.waiting_for_routing_choice))
+async def handle_routing_choice(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
-    routing = callback.data.split(":")[1]
-    await state.update_data(account_routing=routing)
-    await proceed_to_speed_selection(callback.message, state)
-
-async def proceed_to_speed_selection(message: Message, state: FSMContext):
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🟢 Safer Speed (5.0s)", callback_data="set_speed:safe", style="success")],
-        [InlineKeyboardButton(text="🟡 Accelerated Speed (2.5s)", callback_data="set_speed:safer", style="primary")],
-        [InlineKeyboardButton(text="🔴 Maximum Speed (0.05s) [Ban Risk]", callback_data="set_speed:fastest", style="danger")]
-    ])
-    await message.edit_text("<b>Step 1b: Configure Task execution delay speed matrix limits:</b>", reply_markup=kb, parse_mode="HTML")
-    await state.set_state(TaskWizardStates.waiting_for_speed_choice)
-
-@router.callback_query(StateFilter(TaskWizardStates.waiting_for_speed_choice), F.data.startswith("set_speed:"))
-async def task_hub_process_speed(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    speed_mode = callback.data.split(":")[1]
-    await state.update_data(speed_mode=speed_mode)
+    scope = callback.data.split(":")[1]
+    await state.update_data(account_routing=scope)
     
-    data = await state.get_data()
-    task_type = data.get("task_type")
-
-    if task_type == "leave":
-        await callback.message.edit_text(
-            "<b>Step 2: Choose evacuation strategy profile:</b>", 
-            reply_markup=get_leave_channel_options_keyboard(),
-            parse_mode="HTML"
-        )
-        await state.set_state(TaskWizardStates.waiting_for_leave_choice)
-    elif "react" in task_type or "vote" in task_type or task_type in ["view", "speed"]:
-        await callback.message.edit_text("<b>Step 2: Provide targeted public handle destination or private link reference (e.g. @channelname or -100xxxxx):</b>", parse_mode="HTML")
-        await state.set_state(TaskWizardStates.waiting_for_channel_link)
-    elif task_type == "refer":
-        await callback.message.edit_text("<b>Step 2: Input target referral link parameter query string value (Example: https://t.me/Bot?start=123):</b>", parse_mode="HTML")
-        await state.set_state(TaskWizardStates.waiting_for_post_link)
+    user_id = callback.from_user.id
+    if scope == "all":
+        active_count = await db_mgr.db.accounts.count_documents({"status": "active"})
     else:
-        await callback.message.edit_text("<b>Step 2: Enter destination community target endpoint path link or channel ID:</b>", parse_mode="HTML")
-        await state.set_state(TaskWizardStates.waiting_for_post_link)
+        active_count = await db_mgr.db.accounts.count_documents({"status": "active", "user_id": user_id})
 
-@router.callback_query(StateFilter(TaskWizardStates.waiting_for_leave_choice), F.data.startswith("leave_mode:"))
-async def task_hub_process_leave_choice(callback: CallbackQuery, state: FSMContext):
+    await display_task_types_menu(callback.message, active_count)
+    await state.set_state(TaskWizardStates.choosing_type)
+
+async def display_task_types_menu(message_obj: Any, active_count: int):
+    hub_text = (
+        f"🌋 <b>Campaign Launch Console Terminal</b>\n\n"
+        f"⚡ Accessible Active Engine Workers: <code>{active_count}</code> accounts\n"
+        f"Choose target automation campaign execution below:"
+    )
+    if isinstance(message_obj, Message):
+        await message_obj.answer(hub_text, reply_markup=get_task_types_keyboard(active_count), parse_mode="HTML")
+    else:
+        await message_obj.edit_text(hub_text, reply_markup=get_task_types_keyboard(active_count), parse_mode="HTML")
+
+@router.callback_query(F.data.startswith("set_type:"), StateFilter(TaskWizardStates.choosing_type))
+async def handle_type_selection(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    selected_task_type = callback.data.split(":")[1]
+    await state.update_data(task_type=selected_task_type, selected_emojis=[])
+
+    if selected_task_type == "leave":
+        text = "❌ <b>Select Leave Channel Deployment Scope:</b>"
+        await callback.message.edit_text(text, reply_markup=get_leave_channel_options_keyboard(), parse_mode="HTML")
+        await state.set_state(TaskWizardStates.waiting_for_leave_choice)
+    elif selected_task_type in ["react", "react_vote", "react_view", "react_vote_view"]:
+        await prompt_for_emojis(callback.message, [])
+        await state.set_state(TaskWizardStates.waiting_for_emojis)
+    elif selected_task_type in ["vote", "vote_view"]:
+        await prompt_for_vote_mode(callback.message)
+        await state.set_state(TaskWizardStates.waiting_for_vote_mode_choice)
+    elif selected_task_type == "dm":
+        text = "💬 <b>Enter the raw Direct DM message body text to dispatch:</b>"
+        await callback.message.edit_text(text, parse_mode="HTML")
+        await state.set_state(TaskWizardStates.waiting_for_dm_text)
+    elif selected_task_type in ["view", "join", "refer", "speed"]:
+        text = "🔗 <b>Provide public/private target Telegram channel link or username:</b>\n<i>(e.g., https://t.me/example, @example, or https://t.me/+AbCdEfGhIjKlMnOp)</i>"
+        await callback.message.edit_text(text, parse_mode="HTML")
+        await state.set_state(TaskWizardStates.waiting_for_channel_link)
+
+@router.callback_query(F.data.startswith("leave_mode:"), StateFilter(TaskWizardStates.waiting_for_leave_choice))
+async def handle_leave_choice(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     mode = callback.data.split(":")[1]
     await state.update_data(leave_mode=mode)
-
+    
     if mode == "all":
-        await state.update_data(target="ALL CHANNELS")
-        await prompt_for_account_scale(callback.message, state)
+        await prompt_for_speed(callback.message)
+        await state.set_state(TaskWizardStates.waiting_for_speed_choice)
     else:
-        await callback.message.edit_text("<b>Step 3: Paste public link, private channel invite code, or numeric channel ID:</b>", parse_mode="HTML")
-        await state.set_state(TaskWizardStates.waiting_for_post_link)
+        text = "🔗 <b>Provide link/username of channel to leave:</b>"
+        await callback.message.edit_text(text, parse_mode="HTML")
+        await state.set_state(TaskWizardStates.waiting_for_channel_link)
 
-@router.message(StateFilter(TaskWizardStates.waiting_for_channel_link))
-async def task_hub_process_channel_link(message: Message, state: FSMContext):
-    channel_target = message.text.strip()
-    await state.update_data(channel_target=channel_target)
-    await message.answer("<b>Step 3: Paste message tracker specific structural index link URL (Example: https://t.me/channelname/123):</b>", parse_mode="HTML")
-    await state.set_state(TaskWizardStates.waiting_for_post_link)
-
-@router.message(StateFilter(TaskWizardStates.waiting_for_post_link))
-async def task_hub_process_target(message: Message, state: FSMContext, bot: Bot):
-    target = message.text.strip()
-    await state.update_data(target=target)
-    
-    _, _, _, link_query_vote = parse_telegram_link(target)
-    
-    data = await state.get_data()
-    task_type = data.get("task_type")
-
-    if task_type in ["join", "leave", "refer", "view", "speed"]:
-        await prompt_for_account_scale(message, state)
-    elif "react" in task_type and "vote" not in task_type:
-        await state.update_data(selected_emojis=[])
-        await message.answer(
-            "<b>Step 4: Select target reaction array configurations:</b>",
-            reply_markup=get_emoji_selection_keyboard([]),
-            parse_mode="HTML"
-        )
-        await state.set_state(TaskWizardStates.waiting_for_emojis)
-    elif "vote" in task_type:
-        if link_query_vote:
-            await state.update_data(vote_mode="inline", button_text=link_query_vote)
-            if "react" in task_type:
-                await state.update_data(selected_emojis=[])
-                await message.answer(
-                    "<b>Step 4: Select concurrent target reaction array configurations:</b>",
-                    reply_markup=get_emoji_selection_keyboard([]),
-                    parse_mode="HTML"
-                )
-                await state.set_state(TaskWizardStates.waiting_for_emojis)
-            else:
-                await prompt_for_account_scale(message, state)
-            return
-
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🎛️ Inline Callback Keyboard Button / Emoji", callback_data="set_vmode:inline", style="primary")],
-            [InlineKeyboardButton(text="🔘 Native Poll Option Index Selection", callback_data="set_vmode:poll", style="primary")]
-        ])
-        await message.answer("<b>Step 4: Specify the structural mechanics type of voting button to target:</b>", parse_mode="HTML")
-        await state.set_state(TaskWizardStates.waiting_for_vote_mode_choice)
-    elif task_type == "dm":
-        await message.answer("<b>Step 4: Write exact content message context layout to disperse across targets:</b>", parse_mode="HTML")
-        await state.set_state(TaskWizardStates.waiting_for_dm_text)
-
-@router.callback_query(StateFilter(TaskWizardStates.waiting_for_vote_mode_choice), F.data.startswith("set_vmode:"))
-async def handle_vote_mode_choice(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    vmode = callback.data.split(":")[1]
-    await state.update_data(vote_mode=vmode)
-    
-    if vmode == "inline":
-        await callback.message.edit_text("<b>Step 4b: Enter target Vote button Emoji or Text string (Example: <code>Vote - 1</code> or <code>❤️</code>):</b>", parse_mode="HTML")
-        await state.set_state(TaskWizardStates.waiting_for_button_text)
+async def prompt_for_emojis(message_obj: Any, selected_emojis: List[str]):
+    text = (
+        f"🔥 <b>Reaction Pack Picker Configuration</b>\n\n"
+        f"Selected Reactions: {' '.join(selected_emojis) if selected_emojis else '<i>None (default 👍)</i>'}\n"
+        f"Click emojis below to toggle inclusion in execution array:"
+    )
+    if isinstance(message_obj, Message):
+        await message_obj.answer(text, reply_markup=get_emoji_selection_keyboard(selected_emojis), parse_mode="HTML")
     else:
-        await callback.message.edit_text("<b>Step 4b: Enter native question option choice index number to register (First option starts at 0, Second is 1, etc):</b>", parse_mode="HTML")
-        await state.set_state(TaskWizardStates.waiting_for_poll_option_index)
+        await message_obj.edit_text(text, reply_markup=get_emoji_selection_keyboard(selected_emojis), parse_mode="HTML")
 
-@router.message(StateFilter(TaskWizardStates.waiting_for_poll_option_index))
-async def process_poll_option_index(message: Message, state: FSMContext):
-    val = message.text.strip()
-    if not val.isdigit():
-        await message.answer("❌ Option pointer index value must be a zero-indexed numerical integer.")
-        return
-    await state.update_data(poll_option_index=int(val))
-    
-    data = await state.get_data()
-    if "react" in data.get("task_type", ""):
-        await state.update_data(selected_emojis=[])
-        await message.answer(
-            "<b>Step 5: Select concurrent target reaction array configurations:</b>",
-            reply_markup=get_emoji_selection_keyboard([]),
-            parse_mode="HTML"
-        )
-        await state.set_state(TaskWizardStates.waiting_for_emojis)
-    else:
-        await prompt_for_account_scale(message, state)
-
-@router.callback_query(StateFilter(TaskWizardStates.waiting_for_emojis), F.data.startswith("toggle_emoji:"))
-async def handle_toggle_emoji(callback: CallbackQuery, state: FSMContext):
+@router.callback_query(F.data.startswith("toggle_emoji:"), StateFilter(TaskWizardStates.waiting_for_emojis))
+async def toggle_emoji_callback(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     emoji = callback.data.split(":")[1]
-    data = await state.get_data()
-    selected = data.get("selected_emojis", [])
-    if emoji in selected:
-        selected.remove(emoji)
-    else:
-        selected.append(emoji)
-    await state.update_data(selected_emojis=selected)
-    await callback.message.edit_reply_markup(reply_markup=get_emoji_selection_keyboard(selected))
+    fsm_data = await state.get_data()
+    selected_emojis = fsm_data.get("selected_emojis", [])
 
-@router.callback_query(StateFilter(TaskWizardStates.waiting_for_emojis), F.data == "finish_emoji_selection")
-async def finish_emoji_selection(callback: CallbackQuery, state: FSMContext, bot: Bot):
-    data = await state.get_data()
-    selected = data.get("selected_emojis", [])
-    if not selected:
-        await callback.answer("⚠️ You must pick at least 1 active target reaction element.", show_alert=True)
-        return
+    if emoji in selected_emojis:
+        selected_emojis.remove(emoji)
+    else:
+        selected_emojis.append(emoji)
+
+    await state.update_data(selected_emojis=selected_emojis)
+    await prompt_for_emojis(callback.message, selected_emojis)
+
+@router.callback_query(F.data == "finish_emoji_selection", StateFilter(TaskWizardStates.waiting_for_emojis))
+async def finish_emoji_selection(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
-    await state.update_data(reactions=selected)
-    await prompt_for_account_scale(callback.message, state)
+    fsm_data = await state.get_data()
+    selected_task_type = fsm_data.get("task_type", "")
+
+    if selected_task_type in ["react_vote", "react_vote_view"]:
+        await prompt_for_vote_mode(callback.message)
+        await state.set_state(TaskWizardStates.waiting_for_vote_mode_choice)
+    else:
+        text = "🔗 <b>Provide public/private target Telegram channel link or username:</b>"
+        await callback.message.edit_text(text, parse_mode="HTML")
+        await state.set_state(TaskWizardStates.waiting_for_channel_link)
+
+async def prompt_for_vote_mode(message_obj: Any):
+    text = "🗳️ <b>Choose Poll or Inline Voting Framework Target:</b>"
+    buttons = [
+        [InlineKeyboardButton(text="📊 Standard Native Telegram Poll", callback_data="vote_mode:poll", style="primary")],
+        [InlineKeyboardButton(text="🔘 Inline Keyboard Callback Button", callback_data="vote_mode:inline", style="primary")]
+    ]
+    if isinstance(message_obj, Message):
+        await message_obj.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
+    else:
+        await message_obj.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
+
+@router.callback_query(F.data.startswith("vote_mode:"), StateFilter(TaskWizardStates.waiting_for_vote_mode_choice))
+async def handle_vote_mode_choice(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    v_mode = callback.data.split(":")[1]
+    await state.update_data(vote_mode=v_mode)
+
+    if v_mode == "poll":
+        text = "🔢 <b>Enter zero-based poll option index integer to vote for:</b>\n<i>(e.g., 0 for First Option, 1 for Second Option, etc.)</i>"
+        await callback.message.edit_text(text, parse_mode="HTML")
+        await state.set_state(TaskWizardStates.waiting_for_poll_option_index)
+    else:
+        text = "🔤 <b>Type exact button text label or emoji symbol on the inline button:</b>"
+        await callback.message.edit_text(text, parse_mode="HTML")
+        await state.set_state(TaskWizardStates.waiting_for_button_text)
+
+@router.message(StateFilter(TaskWizardStates.waiting_for_poll_option_index))
+async def process_poll_index(message: Message, state: FSMContext):
+    val = message.text.strip()
+    if not val.isdigit():
+        await message.answer("❌ Please provide a valid numerical integer (e.g., 0, 1, 2).")
+        return
+    await state.update_data(poll_option_index=int(val))
+    text = "🔗 <b>Provide public/private target Telegram channel link or username:</b>"
+    await message.answer(text, parse_mode="HTML")
+    await state.set_state(TaskWizardStates.waiting_for_channel_link)
 
 @router.message(StateFilter(TaskWizardStates.waiting_for_button_text))
-async def process_button_text(message: Message, state: FSMContext, bot: Bot):
-    await state.update_data(button_text=message.text.strip())
-    data = await state.get_data()
-    if "react" in data.get("task_type", ""):
-        await state.update_data(selected_emojis=[])
-        await message.answer(
-            "<b>Step 5: Select concurrent target reaction array configurations:</b>",
-            reply_markup=get_emoji_selection_keyboard([]),
-            parse_mode="HTML"
-        )
-        await state.set_state(TaskWizardStates.waiting_for_emojis)
-    else:
-        await prompt_for_account_scale(message, state)
+async def process_button_text(message: Message, state: FSMContext):
+    btn_text = message.text.strip()
+    await state.update_data(button_text=btn_text)
+    text = "🔗 <b>Provide public/private target Telegram channel link or username:</b>"
+    await message.answer(text, parse_mode="HTML")
+    await state.set_state(TaskWizardStates.waiting_for_channel_link)
 
 @router.message(StateFilter(TaskWizardStates.waiting_for_dm_text))
-async def process_dm_text(message: Message, state: FSMContext, bot: Bot):
-    await state.update_data(text=message.text.strip())
-    await prompt_for_account_scale(message, state)
+async def process_dm_text(message: Message, state: FSMContext):
+    dm_body = message.text.strip()
+    await state.update_data(dm_text=dm_body)
+    text = "🔗 <b>Provide public target user handle or ID to send message to:</b>"
+    await message.answer(text, parse_mode="HTML")
+    await state.set_state(TaskWizardStates.waiting_for_channel_link)
 
-async def prompt_for_account_scale(message: Message, state: FSMContext):
-    user_id = message.chat.id if isinstance(message, Message) else message.from_user.id
+@router.message(StateFilter(TaskWizardStates.waiting_for_channel_link))
+async def process_channel_link(message: Message, state: FSMContext):
+    link = message.text.strip()
+    await state.update_data(channel_link=link)
+    fsm_data = await state.get_data()
+    selected_task_type = fsm_data.get("task_type", "")
+
+    if selected_task_type in ["react", "vote", "view", "react_vote", "react_view", "vote_view", "react_vote_view", "speed"]:
+        parsed_target, link_msg_id, _, _ = parse_telegram_link(link)
+        if link_msg_id:
+            await state.update_data(post_link=link)
+            await prompt_for_speed(message)
+            await state.set_state(TaskWizardStates.waiting_for_speed_choice)
+        else:
+            text = "📍 <b>Provide target Telegram message post link:</b>\n<i>(e.g. https://t.me/channel/123 or https://t.me/c/12345/678)</i>"
+            await message.answer(text, parse_mode="HTML")
+            await state.set_state(TaskWizardStates.waiting_for_post_link)
+    else:
+        await prompt_for_speed(message)
+        await state.set_state(TaskWizardStates.waiting_for_speed_choice)
+
+@router.message(StateFilter(TaskWizardStates.waiting_for_post_link))
+async def process_post_link(message: Message, state: FSMContext):
+    p_link = message.text.strip()
+    await state.update_data(post_link=p_link)
+    await prompt_for_speed(message)
+    await state.set_state(TaskWizardStates.waiting_for_speed_choice)
+
+async def prompt_for_speed(message_obj: Any):
+    text = "🏎️ <b>Choose Task Execution Delay Profile:</b>"
+    buttons = [
+        [InlineKeyboardButton(text="⚡ Safer (2.5s Delay)", callback_data="speed_mode:safer", style="success")],
+        [InlineKeyboardButton(text="🛡️ Safe Mode (5.0s Delay)", callback_data="speed_mode:safe", style="primary")],
+        [InlineKeyboardButton(text="🚀 Fastest Speed (0.05s Delay)", callback_data="speed_mode:fastest", style="danger")]
+    ]
+    if isinstance(message_obj, Message):
+        await message_obj.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
+    else:
+        await message_obj.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
+
+@router.callback_query(F.data.startswith("speed_mode:"), StateFilter(TaskWizardStates.waiting_for_speed_choice))
+async def handle_speed_choice(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    spd = callback.data.split(":")[1]
+    await state.update_data(speed_mode=spd)
+
+    user_id = callback.from_user.id
+    fsm_data = await state.get_data()
+    account_routing = fsm_data.get("account_routing", "own")
     role = await db_mgr.get_user_role(user_id)
-    data = await state.get_data()
-    account_routing = data.get("account_routing", "own")
-    
-    if role == "super_owner" and account_routing == "all":
-        max_available = await db_mgr.db.accounts.count_documents({"status": "active"})
+
+    if role == "super_owner":
+        if account_routing == "all":
+            max_avail = await db_mgr.db.accounts.count_documents({"status": "active"})
+        else:
+            max_avail = await db_mgr.db.accounts.count_documents({"status": "active", "user_id": user_id})
     elif role == "owner":
-        max_available = await db_mgr.db.accounts.count_documents({"status": "active"})
+        max_avail = await db_mgr.db.accounts.count_documents({"status": "active"})
     else:
         assignments = await db_mgr.db.account_assignments.find({"user_id": user_id}).to_list(length=None)
         assigned_phones = [a["phone"] for a in assignments]
-        max_available = await db_mgr.db.accounts.count_documents({
+        max_avail = await db_mgr.db.accounts.count_documents({
             "status": "active",
             "$or": [
                 {"user_id": user_id},
                 {"phone": {"$in": assigned_phones}}
             ]
         })
-        
-    prompt_msg = (
-        f"🔢 <b>Account Deployment Volume Capacity Selection</b>\n\n"
-        f"Total available online session keys within selected boundary: <code>{max_available}</code>\n"
-        f"Input capacity allocation limits variable to run:\n"
-        f"<i>(Type <code>0</code> to mobilize ALL available online sessions matching boundary parameters)</i>"
-    )
-    
-    if isinstance(message, Message):
-        await message.answer(prompt_msg, parse_mode="HTML")
-    else:
-        await message.answer(prompt_msg, parse_mode="HTML")
-        
+
+    text = f"🔢 <b>Type count of accounts to run on this task:</b>\n<i>(Available active operational accounts: <code>{max_avail}</code>)</i>"
+    await callback.message.edit_text(text, parse_mode="HTML")
     await state.set_state(TaskWizardStates.waiting_for_account_scale)
 
 @router.message(StateFilter(TaskWizardStates.waiting_for_account_scale))
-async def process_account_scale(message: Message, state: FSMContext, bot: Bot):
-    scale_text = message.text.strip()
-    if not scale_text.isdigit():
-        await message.answer("❌ <b>Syntax Error:</b> Numerical integer capacity scaling inputs expected exclusively:")
-        return
-        
-    requested_count = int(scale_text)
+async def process_account_scale_and_launch(message: Message, state: FSMContext, bot: Bot):
     user_id = message.from_user.id
-    role = await db_mgr.get_user_role(user_id)
-    data = await state.get_data()
-    account_routing = data.get("account_routing", "own")
-    
-    if role == "super_owner" and account_routing == "all":
-        max_available = await db_mgr.db.accounts.count_documents({"status": "active"})
-    elif role == "owner":
-        max_available = await db_mgr.db.accounts.count_documents({"status": "active"})
-    else:
-        assignments = await db_mgr.db.account_assignments.find({"user_id": user_id}).to_list(length=None)
-        assigned_phones = [a["phone"] for a in assignments]
-        max_available = await db_mgr.db.accounts.count_documents({
-            "status": "active",
-            "$or": [
-                {"user_id": user_id},
-                {"phone": {"$in": assigned_phones}}
-            ]
-        })
+    val = message.text.strip()
 
-    if requested_count > max_available:
-        await message.answer(f"❌ <b>Resource Boundary Exceeded:</b> Accessible session pool caps at <code>{max_available}</code>. Lower your scale query value:", parse_mode="HTML")
+    if not val.isdigit() or int(val) <= 0:
+        await message.answer("❌ Invalid integer value. Enter positive number count:")
         return
 
-    await state.update_data(run_account_count=requested_count)
-    await finalize_task_creation(message, state, bot)
+    run_account_count = int(val)
+    fsm_data = await state.get_data()
+    await state.clear()
 
-async def finalize_task_creation(message: Message, state: FSMContext, bot: Bot):
-    data = await state.get_data()
-    user_id = message.chat.id if isinstance(message, Message) else message.from_user.id
-    task_type = data.pop("task_type")
-    target = data.get("target", "")
+    task_type = fsm_data.get("task_type", "view")
+    channel_link = fsm_data.get("channel_link", "")
+    post_link = fsm_data.get("post_link", channel_link)
     
-    if data.get("leave_mode") != "all":
-        _, link_msg_id, _, _ = parse_telegram_link(target)
-        if link_msg_id:
-            data["msg_id"] = link_msg_id
+    parsed_channel, _, _, _ = parse_telegram_link(channel_link)
+    parsed_post_target, post_msg_id, _, link_query_vote = parse_telegram_link(post_link)
 
-    init_msg = await bot.send_message(
-        chat_id=user_id, 
-        text="⏳ <b>Bootstrapping cluster deployment threads...</b>\n<i>Connecting active endpoints pool, please maintain connection standby...</i>",
-        parse_mode="HTML"
-    )
+    payload = {
+        "target": parsed_post_target or parsed_channel,
+        "channel_target": parsed_channel or parsed_post_target,
+        "msg_id": post_msg_id,
+        "reactions": fsm_data.get("selected_emojis", ["👍"]),
+        "vote_mode": fsm_data.get("vote_mode", "poll"),
+        "poll_option_index": fsm_data.get("poll_option_index", 0),
+        "button_text": fsm_data.get("button_text", link_query_vote or ""),
+        "text": fsm_data.get("dm_text", "Hello!"),
+        "leave_mode": fsm_data.get("leave_mode", "single"),
+        "speed_mode": fsm_data.get("speed_mode", "safe"),
+        "run_account_count": run_account_count,
+        "account_routing": fsm_data.get("account_routing", "own")
+    }
 
     task_id = await db_mgr.get_next_task_id()
+
     await db_mgr.db.tasks.insert_one({
         "task_id": task_id,
         "creator_id": user_id,
-        "type": task_type,
-        "payload": json.dumps(data),
+        "task_type": task_type,
+        "payload": payload,
         "status": "pending",
         "progress": "0%",
         "created_at": time.time()
     })
 
-    await task_queue.add_task(task_id, user_id, task_type, data, bot, init_msg.message_id)
-    await state.clear()
-
-# --- REPORTS & STATS INTERFACES ---
-@router.callback_query(F.data == "view_tasks")
-async def view_tasks(callback: CallbackQuery, bot: Bot):
-    user_id = callback.from_user.id
-    await callback.answer()
-    role = await db_mgr.get_user_role(user_id)
-    
-    if role in ["owner", "super_owner"]:
-        rows = await db_mgr.db.tasks.find({}).sort("task_id", -1).limit(10).to_list(length=10)
-    else:
-        rows = await db_mgr.db.tasks.find({"creator_id": user_id}).sort("task_id", -1).limit(10).to_list(length=10)
-
-    text = "📊 <b>Historical Campaign Event Feed Records Index Matrix</b>\n\n"
-    for r in rows:
-        text += f"🔹 <b>Task Sheet:</b> <code>#{r['task_id']}</code> (Type: <code>{r['type'].upper()}</code>)\nState tracking: <b>{r['status']}</b> | Metrics: <code>{r['progress']}</code>\nTo call full details map command layout: <code>/taskreport_{r['task_id']}</code>\n\n"
-    await callback.message.edit_text(text if rows else "No active campaign tracking logs catalogued inside runtime registers.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Return Back", callback_data="main_menu", style="primary")]]), parse_mode="HTML")
-
-@router.message(F.text.startswith("/taskreport_"))
-async def cmd_task_report(message: Message, bot: Bot):
-    user_id = message.from_user.id
-    role = await db_mgr.get_user_role(user_id)
-    try:
-        task_id = int(message.text.split("_")[1])
-    except:
-        return
-        
-    row = await db_mgr.db.tasks.find_one({"task_id": task_id})
-
-    if not row or (role not in ["owner", "super_owner"] and row["creator_id"] != user_id):
-        await message.answer("🚫 <b>Data Visibility Restriction Mismatch:</b> Permissions key clearance verification rejected.")
-        return
-
-    report_text = f"📊 <b>Detailed Campaign Metrics Tracking Log</b>\n\n🗂️ Task Sheet reference ID: <code>#{task_id}</code>\n⚡ Code Action signature: <code>{row['type'].upper()}</code>\n🪐 State string indicator: <b>{row['status']}</b>\n📈 Progress indicators graph matrix: <code>{row['progress']}</code>"
-    await message.answer(report_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💎 Home Menu", callback_data="main_menu", style="primary")]]), parse_mode="HTML")
-
-@router.callback_query(F.data == "view_referrals")
-async def view_referrals(callback: CallbackQuery, bot: Bot):
-    user_id = callback.from_user.id
-    await callback.answer()
-    count = await db_mgr.db.users.count_documents({"referred_by": user_id})
-    await callback.message.edit_text(f"👥 <b>Invitation Line Tracking Matrix Analytics</b>\n\nShare your connection link string layout below to register downline user clusters:\n<code>https://t.me/{bot_username}?start=ref_{user_id}</code>\n\nTotal validated downline invitations mapped to your account line reference: <code>{count}</code> accounts.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Return Back", callback_data="main_menu", style="primary")]]), parse_mode="HTML")
-
-@router.callback_query(F.data == "admin_panel")
-async def handle_admin_panel(callback: CallbackQuery, bot: Bot):
-    await callback.answer()
-    buttons = [
-        [InlineKeyboardButton(text="💾 Check Database Storage", callback_data="check_db_storage", style="primary")],
-        [InlineKeyboardButton(text="💎 Return Home Menu", callback_data="main_menu", style="primary")]
-    ]
-    await callback.message.edit_text(
-        "🛡️ <b>Administrative Operational Console Index Terminal</b>\n\n"
-        "Available terminal shell command scripts layout frameworks:\n\n"
-        "🔹 <code>/grantaccess &lt;user_id&gt; [count]</code> - Grant task access for 20 account IDs to user\n"
-        "🔹 <code>/revokeaccess &lt;user_id&gt;</code> - Revoke granted account access\n"
-        "🔹 <code>/addadmin &lt;id&gt;</code> - Promote user node into admin status ranks\n"
-        "🔹 <code>/removeadmin &lt;id&gt;</code> - Deprecate admin structural token access rules\n"
-        "🔹 <code>/broadcast</code> - Force dynamic notification content across global users pools\n"
-        "🔹 <code>/canceltasks</code> - Instantly kill all running thread operations loops safely\n"
-        "🔹 <code>/adminstorage</code> - Display live MongoDB database storage metrics",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    status_card = await message.answer(
+        f"⏳ <b>Campaign Processing Deployment Framework Running...</b>\n\n"
+        f"[{make_progress_bar(0)}] <b>0%</b>\n"
+        f"📊 <code>0/{run_account_count}</code> accounts completely run\n"
+        f"✅ Successful: <code>0</code> | ❌ Blocked: <code>0</code>\n"
+        f"⏱ Time remaining duration: Calculating...",
         parse_mode="HTML"
     )
 
-@router.callback_query(F.data == "system_stats")
-async def system_stats(callback: CallbackQuery, bot: Bot):
+    await task_queue.add_task(
+        task_id=task_id,
+        creator_id=user_id,
+        task_type=task_type,
+        payload=payload,
+        bot_instance=bot,
+        status_msg_id=status_card.message_id
+    )
+
+    await db_mgr.log_action(user_id, f"Launched task #{task_id} ({task_type}) on {run_account_count} accounts", bot, operational=True)
+
+# --- TASK AUDIT & LOGS MONITORING ---
+@router.callback_query(F.data == "view_tasks")
+async def view_active_tasks(callback: CallbackQuery, bot: Bot):
+    user_id = callback.from_user.id
     await callback.answer()
+
+    role = await db_mgr.get_user_role(user_id)
+    if role in ["owner", "super_owner"]:
+        rows = await db_mgr.db.tasks.find({}).sort("created_at", -1).limit(10).to_list(length=10)
+    else:
+        rows = await db_mgr.db.tasks.find({"creator_id": user_id}).sort("created_at", -1).limit(10).to_list(length=10)
+
+    if not rows:
+        text = "📊 <b>Campaign Audit Dashboard Log Hub</b>\n\n<i>Zero campaign execution records mapped.</i>"
+    else:
+        text = "📊 <b>Campaign Audit Dashboard Log Hub (Recent 10 Tasks)</b>\n\n"
+        for r in rows:
+            st = r.get("status", "pending").upper()
+            icon = "🟢" if st == "COMPLETED" else ("🟡" if st == "RUNNING" else "🔴")
+            text += f"{icon} <b>Task #{r['task_id']}</b> [{r['task_type'].upper()}]\nStatus: <b>{st}</b> | Progress: <code>{r.get('progress', '0%')}</code>\n\n"
+
+    buttons = [[InlineKeyboardButton(text="💎 Home Menu", callback_data="main_menu", style="primary")]]
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
+
+# --- REFERRAL NETWORK HOOKS ---
+@router.callback_query(F.data == "view_referrals")
+async def view_referrals_menu(callback: CallbackQuery, bot: Bot):
+    user_id = callback.from_user.id
+    await callback.answer()
+
+    ref_count = await db_mgr.db.users.count_documents({"referred_by": user_id})
+    ref_link = f"https://t.me/{bot_username}?start=ref_{user_id}"
+
+    text = (
+        f"⚜️ <b>Referral Network Telemetry Dashboard</b>\n\n"
+        f"Your Personal Referral Link:\n<code>{ref_link}</code>\n\n"
+        f"👥 Total Invited Active Users: <code>{ref_count}</code>"
+    )
+    buttons = [[InlineKeyboardButton(text="💎 Return Home Menu", callback_data="main_menu", style="primary")]]
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
+
+# --- ADMINISTRATIVE TELEMETRY METRICS ---
+@router.callback_query(F.data == "admin_panel")
+async def view_admin_panel(callback: CallbackQuery, bot: Bot):
     user_id = callback.from_user.id
     role = await db_mgr.get_user_role(user_id)
-    
-    if role != "super_owner":
-        await callback.message.edit_text("🚫 System metrics dashboard view access restricted to core developers.")
+    if role not in ["admin", "owner", "super_owner"]:
+        await callback.answer("⚠️ Clearance Level Denied.", show_alert=True)
         return
-        
+
+    await callback.answer()
     total_users = await db_mgr.db.users.count_documents({})
     total_accounts = await db_mgr.db.accounts.count_documents({})
     active_accounts = await db_mgr.db.accounts.count_documents({"status": "active"})
-    
-    distinct_user_ids = await db_mgr.db.accounts.distinct("user_id")
-    user_rows = await db_mgr.db.users.find({
-        "$or": [
-            {"role": "admin"},
-            {"user_id": {"$in": distinct_user_ids}}
-        ]
-    }).to_list(length=None)
-    
-    admin_metrics_text = "\n👥 <b>Structural Account Space Partition Allocation Map Logs:</b>\n"
-    for u in user_rows:
-        u_id = u["user_id"]
-        u_name = u.get("username", "None")
-        u_role = u.get("role", "user")
-        acc_count = await db_mgr.db.accounts.count_documents({"user_id": u_id})
-        admin_metrics_text += f"• Node profile target: <code>{u_id}</code> (<b>@{u_name}</b>) [<b>{u_role.upper()}</b>] ➜ Linked slots count: <code>{acc_count}</code> items\n"
-            
-    stats_text = (
-        f"📈 <b>Live System Production Core Performance Summary Metrics</b>\n\n"
-        f"👥 Global active profiles space size: <code>{total_users}</code> users\n"
-        f"📱 Total linked terminal telephony sessions: <code>{total_accounts}</code> instances\n"
-        f"🟢 Active operational connection streams online: <code>{active_accounts}</code> nodes\n"
-        f"----------------------------------------------------"
-        f"{admin_metrics_text}"
+    dead_accounts = await db_mgr.db.accounts.count_documents({"status": "dead"})
+
+    text = (
+        f"🛡️ <b>Administrative Panel Command Terminal</b>\n\n"
+        f"👤 Total System Users Registered: <code>{total_users}</code>\n"
+        f"📱 Total Datastore Accounts: <code>{total_accounts}</code>\n"
+        f"🟢 Operational Accounts: <code>{active_accounts}</code>\n"
+        f"🔴 Deactivated Accounts: <code>{dead_accounts}</code>\n\n"
+        f"<b>Admin Control Commands:</b>\n"
+        f"• <code>/addadmin &lt;user_id&gt;</code> - Grant admin access\n"
+        f"• <code>/removeadmin &lt;user_id&gt;</code> - Revoke admin access\n"
+        f"• <code>/grantaccess &lt;user_id&gt; [count]</code> - Grant account ID execution access\n"
+        f"• <code>/revokeaccess &lt;user_id&gt;</code> - Revoke assigned account access\n"
+        f"• <code>/broadcast</code> - Dispatch global system message\n"
+        f"• <code>/canceltasks</code> - Cancel running/pending campaign tasks\n"
+        f"• <code>/adminstorage</code> - View MongoDB telemetry metrics"
     )
-    
-    await callback.message.edit_text(text=stats_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💎 Return Home Menu", callback_data="main_menu", style="primary")]]), parse_mode="HTML")
 
-# --- BOOTSTRAPPING RUNTIME ---
-async def verify_saved_sessions():
-    logger.info("Verifying all active account database sessions...")
-    accounts = await db_mgr.db.accounts.find({"status": "active"}).to_list(length=None)
-    
-    semaphore = asyncio.Semaphore(10)
-    async def check_account(phone, enc_session):
-        async with semaphore:
-            try:
-                client = TelegramClient(StringSession(decrypt_data(enc_session)), config.API_ID, config.API_HASH)
-                await client.connect()
-                if not await client.is_user_authorized():
-                    await db_mgr.db.accounts.update_one({"phone": phone}, {"$set": {"status": "dead"}})
-                await client.disconnect()
-            except:
-                pass
-                
-    await asyncio.gather(*(check_account(a["phone"], a["session_string"]) for a in accounts))
+    buttons = [
+        [InlineKeyboardButton(text="💾 Check DB Storage Metrics", callback_data="check_db_storage", style="primary")],
+        [InlineKeyboardButton(text="💎 Return Home Menu", callback_data="main_menu", style="primary")]
+    ]
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
 
-async def main():
-    global bot_username
-    await db_mgr.init()
-    await verify_saved_sessions()
-    if not config.BOT_TOKEN:
+@router.callback_query(F.data == "system_stats")
+async def view_system_stats(callback: CallbackQuery, bot: Bot):
+    user_id = callback.from_user.id
+    role = await db_mgr.get_user_role(user_id)
+    if role not in ["owner", "super_owner"]:
+        await callback.answer("⚠️ Privilege Denied.", show_alert=True)
         return
+
+    await callback.answer()
+    users = await db_mgr.db.users.find({}).to_list(length=50)
+
+    text = "📈 <b>System Users Overview</b>\n\n"
+    for u in users:
+        acc_cnt = await db_mgr.db.accounts.count_documents({"user_id": u['user_id']})
+        text += f"• <code>{u['user_id']}</code> (@{u.get('username', 'None')}) ➜ Role: <b>{u.get('role', 'user').upper()}</b> | Accounts: <code>{acc_cnt}</code>\n"
+
+    buttons = [[InlineKeyboardButton(text="💎 Return Home Menu", callback_data="main_menu", style="primary")]]
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
+
+# --- INITIALIZATION ENGINE ENTRYPOINT ---
+async def main():
+    await db_mgr.init()
+    
     bot = Bot(token=config.BOT_TOKEN)
-    bot_info = await bot.get_me()
-    bot_username = bot_info.username
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-    worker_task = asyncio.create_task(task_queue.start_worker())
+
+    global bot_username
     try:
-        await dp.start_polling(bot)
-    finally:
-        worker_task.cancel()
-        await bot.session.close()
+        bot_user = await bot.get_me()
+        bot_username = bot_user.username
+        logger.info(f"Connected as @{bot_username}")
+    except Exception as e:
+        logger.error(f"Failed fetching Bot Identity: {e}")
+
+    asyncio.create_task(task_queue.start_worker())
+
+    logger.info("Bot event polling initiated.")
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Bot execution successfully stopped.")
+    asyncio.run(main())
