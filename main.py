@@ -68,7 +68,6 @@ def parse_telegram_link(link: str) -> Tuple[Any, Optional[int], bool, Optional[s
         return None, None, False, None
         
     extracted_query = None
-    # Extract query/emoji target attached to links (e.g., ?vote=❤️ or link containing emojis)
     if "?vote=" in link:
         parts = link.split("?vote=")
         link = parts[0]
@@ -377,9 +376,11 @@ class TaskQueue:
 
                     joined_updates_peer = None
 
-                    if do_join:
+                    # Auto-join channel/group if applicable
+                    async def auto_join_channel():
+                        nonlocal joined_updates_peer
                         try:
-                            if is_channel_private or "+ " in channel_target or "/+" in channel_target or "joinchat/" in channel_target:
+                            if is_channel_private or "+ " in str(channel_target) or "/+" in str(channel_target) or "joinchat/" in str(channel_target):
                                 invite_hash = parsed_channel if is_channel_private else parsed_target
                                 updates = await client(functions.messages.ImportChatInviteRequest(hash=str(invite_hash).strip()))
                                 if hasattr(updates, 'chats') and updates.chats:
@@ -390,11 +391,24 @@ class TaskQueue:
                                     joined_updates_peer = updates.chats[0]
                         except Exception as join_err:
                             if "USER_ALREADY_PARTICIPANT" not in str(join_err):
-                                failed_ids.append((phone, f"Failed to join chat/channel: {str(join_err)}"))
-                                failure_counter += 1
-                                return
+                                raise join_err
+
+                    if do_join:
+                        try:
+                            await auto_join_channel()
+                        except Exception as join_err:
+                            failed_ids.append((phone, f"Failed to join chat/channel: {str(join_err)}"))
+                            failure_counter += 1
+                            return
 
                     target_peer = joined_updates_peer or parsed_target
+
+                    # Auto-join attempt for reaction/vote tasks if not already joined
+                    if (do_react or do_vote) and not do_leave_all:
+                        try:
+                            await auto_join_channel()
+                        except Exception:
+                            pass
 
                     if do_view and msg_id:
                         try:
@@ -409,6 +423,19 @@ class TaskQueue:
                             peer_entity = await client.get_input_entity(target_peer)
                             emojis = payload.get("reactions", ["👍"])
                             assigned_emoji = emojis[idx % len(emojis)]
+
+                            # Check existing message reactions to react on existing reaction if present
+                            try:
+                                msg = await client.get_messages(peer_entity, ids=msg_id)
+                                if msg and hasattr(msg, 'reactions') and msg.reactions and msg.reactions.results:
+                                    existing_emojis = []
+                                    for r_item in msg.reactions.results:
+                                        if hasattr(r_item.reaction, 'emoticon'):
+                                            existing_emojis.append(r_item.reaction.emoticon)
+                                    if existing_emojis:
+                                        assigned_emoji = existing_emojis[idx % len(existing_emojis)]
+                            except Exception:
+                                pass
 
                             await client(functions.messages.SendReactionRequest(
                                 peer=peer_entity,
@@ -473,15 +500,7 @@ class TaskQueue:
                             except Exception as first_vote_err:
                                 # Auto-join channel if non-member and retry vote
                                 try:
-                                    if is_channel_private or "+ " in str(channel_target) or "/+" in str(channel_target) or "joinchat/" in str(channel_target):
-                                        invite_hash = parsed_channel if is_channel_private else parsed_target
-                                        updates = await client(functions.messages.ImportChatInviteRequest(hash=str(invite_hash).strip()))
-                                        if hasattr(updates, 'chats') and updates.chats:
-                                            target_peer = updates.chats[0]
-                                    else:
-                                        updates = await client(functions.channels.JoinChannelRequest(channel=parsed_channel or parsed_target))
-                                        if hasattr(updates, 'chats') and updates.chats:
-                                            target_peer = updates.chats[0]
+                                    await auto_join_channel()
                                     await asyncio.sleep(1)
                                     await perform_vote()
                                 except Exception:
