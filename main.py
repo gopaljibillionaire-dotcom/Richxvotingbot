@@ -428,6 +428,7 @@ class TaskQueue:
                                 failure_counter += 1
                                 return
 
+                    # --- UPDATED VOTE HANDLING FOR BOTH EMOJI AND DYNAMIC VOTE STRINGS ---
                     if do_vote and msg_id:
                         try:
                             vote_mode = payload.get("vote_mode", "text")
@@ -438,6 +439,7 @@ class TaskQueue:
                                     if link_query_vote and not raw_button_text:
                                         raw_button_text = link_query_vote.strip().lower()
                                         
+                                    # Normalize base text (removes trailing numbers/dashes e.g., "Vote - 1" -> "vote")
                                     clean_target = re.sub(r'[\s\-_\(\)\[\]\d]+$', '', raw_button_text)
 
                                     msg = await client.get_messages(target_peer, ids=msg_id)
@@ -448,6 +450,7 @@ class TaskQueue:
                                                 btn_raw = btn.text.strip().lower()
                                                 btn_clean = re.sub(r'[\s\-_\(\)\[\]\d]+$', '', btn_raw)
 
+                                                # Robust matching logic for static text, emojis, and dynamic numbers ("Vote - 1", "Vote - 2")
                                                 if (
                                                     raw_button_text in btn_raw or 
                                                     (clean_target and clean_target in btn_raw) or
